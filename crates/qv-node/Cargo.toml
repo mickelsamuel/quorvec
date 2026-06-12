@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 qv-proto = { path = "../qv-proto" }
 qv-hnsw = { path = "../qv-hnsw" }
+qv-storage = { path = "../qv-storage" }
+qv-cluster = { path = "../qv-cluster" }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
@@ -35,3 +37,4 @@ anyhow = { workspace = true }
 qv-client = { path = "../qv-client" }
 tempfile = { workspace = true }
 rand = { workspace = true }
+tonic = { workspace = true }

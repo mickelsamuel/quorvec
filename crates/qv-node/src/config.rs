@@ -18,11 +18,13 @@ use std::path::PathBuf;
 pub struct NodeConfig {
     /// Stable numeric id for this node.
     pub node_id: u64,
-    /// Address the gRPC server binds to.
+    /// Address the gRPC server binds to (a concrete IP:port).
     pub listen_addr: SocketAddr,
-    /// Address other nodes use to reach this one (defaults to listen_addr).
+    /// Address other nodes use to reach this one. A `host:port` string — it may
+    /// be a hostname (e.g. a container/service name) rather than an IP, so it is
+    /// NOT parsed as a `SocketAddr`. Defaults to the listen address.
     #[serde(default)]
-    pub advertise_addr: Option<SocketAddr>,
+    pub advertise_addr: Option<String>,
     /// Directory for shard data (WAL, snapshots). Created if missing.
     pub data_dir: PathBuf,
     /// Raft seed peers for the metadata plane (M3+; ignored single-node).
@@ -93,9 +95,12 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// The advertise address, falling back to the listen address.
-    pub fn advertise(&self) -> SocketAddr {
-        self.advertise_addr.unwrap_or(self.listen_addr)
+    /// The advertise address as a `host:port` string, falling back to the listen
+    /// address. Peers dial this (it may be a hostname under container DNS).
+    pub fn advertise(&self) -> String {
+        self.advertise_addr
+            .clone()
+            .unwrap_or_else(|| self.listen_addr.to_string())
     }
 }
 
@@ -116,7 +121,21 @@ mod tests {
         assert_eq!(cfg.vnodes, 64);
         assert_eq!(cfg.snapshot_wal_mb, 128);
         assert_eq!(cfg.wal_batch_ms, 0);
-        assert_eq!(cfg.advertise(), cfg.listen_addr);
+        assert_eq!(cfg.advertise(), cfg.listen_addr.to_string());
+    }
+
+    #[test]
+    fn advertise_accepts_hostname() {
+        // A container/service hostname is valid for advertise (not a SocketAddr).
+        let toml = r#"
+            node_id = 2
+            listen_addr = "0.0.0.0:7000"
+            advertise_addr = "qv2:7000"
+            data_dir = "/tmp/qv"
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.advertise(), "qv2:7000");
     }
 
     #[test]

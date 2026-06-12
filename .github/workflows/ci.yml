@@ -45,3 +45,55 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  compose-smoke:
+    name: 3-node compose smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker + compose are preinstalled on GitHub's ubuntu runners (free here;
+      # local dev uses the 5-process localhost cluster per architect ruling R5).
+      - name: Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      # Build the smoke client binary on the host (fast, cached) so we drive the
+      # containerized cluster over gRPC from outside.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build smoke client
+        run: cargo build --release -p qv-client --example smoke
+
+      - name: Build and start the 3-node cluster
+        working-directory: deploy/compose
+        run: |
+          docker compose -f docker-compose.3node.yml up -d --build
+          docker compose -f docker-compose.3node.yml ps
+
+      - name: Run cluster smoke (create on A, upsert via B, search/get via C)
+        run: |
+          ./target/release/examples/smoke \
+            http://127.0.0.1:7001 \
+            http://127.0.0.1:7002 \
+            http://127.0.0.1:7003 \
+            3
+
+      - name: Dump compose logs on failure
+        if: failure()
+        working-directory: deploy/compose
+        run: docker compose -f docker-compose.3node.yml logs --no-color
+
+      - name: Tear down
+        if: always()
+        working-directory: deploy/compose
+        run: docker compose -f docker-compose.3node.yml down -v

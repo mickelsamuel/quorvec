@@ -11,7 +11,7 @@ pub mod shard;
 pub mod snapshot;
 pub mod wal;
 
-pub use hlc::Hlc;
+pub use hlc::{Hlc, HlcClock};
 pub use shard::{Shard, ShardError};
 pub use snapshot::Snapshot;
 pub use wal::{Wal, WalError, WalOp, WalRecord};

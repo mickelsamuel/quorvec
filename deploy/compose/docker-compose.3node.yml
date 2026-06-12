@@ -1,0 +1,55 @@
+# 3-node quorvec cluster (the Raft minimum for a real majority).
+#
+# qv1 is the seed: it bootstraps the cluster and admits qv2/qv3 through Raft via
+# --join. Each node advertises its compose-network hostname so peers can route
+# both the metadata-plane Raft RPCs and the data-plane replica RPCs.
+#
+# This file is authored for and validated by the CI compose smoke job on GitHub's
+# ubuntu runners (Docker is free there). Per architect ruling R5, local dev/test
+# uses the 5-process localhost cluster instead — no local Docker / WSL2.
+name: quorvec-3node
+
+services:
+  qv1:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "1"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv1:7000"
+      QV_BOOTSTRAP: "1"
+      QV_JOIN: "2@qv2:7000,3@qv3:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7001:7000"
+    networks: [quorvec]
+
+  qv2:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "2"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv2:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7002:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+  qv3:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "3"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv3:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7003:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+networks:
+  quorvec:
+    driver: bridge

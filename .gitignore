@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local data / scratch shard dirs produced by tests and harnesses
+/data
+**/qv-data-*/
+*.wal
+*.snap
+
+# Benchmark datasets are NEVER committed (fetched on demand)
+/tools/bench/datasets/
+*.hdf5
+*.fvecs
+*.ivecs
+*.bvecs
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

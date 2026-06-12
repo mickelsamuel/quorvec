@@ -1,0 +1,30 @@
+[package]
+name = "qv-hnsw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Owned HNSW graph + distance kernels for quorvec, plus the VectorIndex trait and a brute-force exact oracle."
+
+[features]
+# `simd` (default) uses the simsimd crate for L2/cosine kernels.
+# Disabling it falls back to the scalar reference implementation.
+default = ["simd"]
+simd = ["dep:simsimd"]
+
+[dependencies]
+simsimd = { workspace = true, optional = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+bincode = { workspace = true }
+
+[[bench]]
+name = "hnsw_bench"
+harness = false

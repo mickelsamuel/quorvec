@@ -1,0 +1,22 @@
+[package]
+name = "qv-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Per-shard WAL, snapshots, shard store, and crash recovery for quorvec."
+
+[dependencies]
+qv-hnsw = { path = "../qv-hnsw" }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+proptest = { workspace = true }

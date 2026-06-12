@@ -1,0 +1,12 @@
+# Normalize line endings to LF in the repo for all text so CI on Linux and
+# local Windows agree. Binary files are left untouched.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.hdf5 binary
+*.fvecs binary
+*.ivecs binary
+*.bvecs binary
+*.snap binary
+*.wal binary

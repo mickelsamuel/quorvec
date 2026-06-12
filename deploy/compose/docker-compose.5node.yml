@@ -1,0 +1,77 @@
+# 5-node quorvec cluster.
+#
+# qv1 is the seed: it bootstraps the cluster and admits qv2..qv5 through Raft via
+# --join. Same model as the 3-node file (see its header). The 5-node topology is
+# the one the plan's M3/M4 acceptance scenarios target; locally that runs as a
+# 5-process localhost cluster (architect ruling R5), and the compose form is
+# validated by the CI smoke job on GitHub's ubuntu runners.
+name: quorvec-5node
+
+services:
+  qv1:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "1"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv1:7000"
+      QV_BOOTSTRAP: "1"
+      QV_JOIN: "2@qv2:7000,3@qv3:7000,4@qv4:7000,5@qv5:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7001:7000"
+    networks: [quorvec]
+
+  qv2:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "2"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv2:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7002:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+  qv3:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "3"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv3:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7003:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+  qv4:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "4"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv4:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7004:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+  qv5:
+    image: quorvec:latest
+    environment:
+      QV_NODE_ID: "5"
+      QV_LISTEN: "0.0.0.0:7000"
+      QV_ADVERTISE: "qv5:7000"
+      RUST_LOG: "info"
+    ports:
+      - "7005:7000"
+    networks: [quorvec]
+    depends_on: [qv1]
+
+networks:
+  quorvec:
+    driver: bridge

@@ -15,14 +15,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let proto_root = workspace_proto_dir();
-    let proto_file = proto_root.join("quorvec.proto");
+    // The LOCKED v1 client surface, and the (separate) internal node-to-node
+    // surface. The internal proto is NOT the v1 contract and may evolve freely.
+    let v1_file = proto_root.join("quorvec.proto");
+    let internal_file = proto_root.join("quorvec_internal.proto");
 
-    println!("cargo:rerun-if-changed={}", proto_file.display());
+    println!("cargo:rerun-if-changed={}", v1_file.display());
+    println!("cargo:rerun-if-changed={}", internal_file.display());
 
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[proto_file], &[proto_root])?;
+        .compile_protos(&[v1_file, internal_file], &[proto_root])?;
 
     Ok(())
 }

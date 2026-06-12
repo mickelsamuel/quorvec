@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+// quorvec INTERNAL node-to-node surface (NOT the v1 client contract).
+//
+// This is deliberately separate from `quorvec.proto`: that file is the LOCKED v1
+// client API and does not change without architect sign-off. This internal
+// service is the cluster's private plumbing — the metadata-plane Raft transport
+// (M3) and the data-plane replica RPCs (M4) — and is free to evolve as the
+// implementation needs, because no external client depends on it.
+//
+// Raft messages are carried as opaque serialized bytes (JSON via openraft's
+// serde feature) so the openraft wire types never leak into proto and an
+// openraft version bump does not force a proto change. The handler deserializes,
+// feeds openraft, and serializes the response.
+package quorvec.internal;
+
+// ----- Metadata-plane Raft transport (M3) -----------------------------------
+
+// One generic envelope for every Raft RPC: an opaque request payload in, an
+// opaque response payload out. `kind` disambiguates which openraft RPC it is so
+// the receiver deserializes into the right type.
+message RaftEnvelope {
+  RaftRpcKind kind = 1;
+  bytes payload = 2; // serialized openraft request
+}
+
+message RaftReply {
+  bytes payload = 1; // serialized openraft response
+}
+
+enum RaftRpcKind {
+  RAFT_RPC_KIND_UNSPECIFIED = 0;
+  RAFT_RPC_KIND_VOTE = 1;
+  RAFT_RPC_KIND_APPEND = 2;
+  RAFT_RPC_KIND_SNAPSHOT = 3;
+}
+
+// ----- Data-plane replica RPCs (M4) -----------------------------------------
+//
+// A coordinator forwards already-HLC-stamped point operations to the replica
+// nodes of a shard. The replica applies LWW and persists to its durable shard.
+// These are filled in at M4; declared here so the internal service surface is
+// stable from M3.
+
+message ReplicaWriteRequest {
+  string collection = 1;
+  uint32 shard_idx = 2;
+  // op: 0 = UPSERT, 1 = DELETE (tombstone)
+  uint32 op = 3;
+  uint64 id = 4;
+  uint64 hlc = 5; // packed HLC (48-bit wall ms << 16 | counter)
+  repeated float vector = 6; // empty for DELETE
+  bytes payload = 7;
+}
+
+message ReplicaWriteResponse {
+  bool applied = 1; // false if rejected as stale (LWW)
+}
+
+message ReplicaGetRequest {
+  string collection = 1;
+  uint32 shard_idx = 2;
+  repeated uint64 ids = 3;
+}
+
+message ReplicaPoint {
+  uint64 id = 1;
+  uint64 hlc = 2;
+  bool tombstone = 3;
+  repeated float vector = 4;
+  bytes payload = 5;
+}
+
+message ReplicaGetResponse {
+  repeated ReplicaPoint points = 1;
+}
+
+message ReplicaSearchRequest {
+  string collection = 1;
+  uint32 shard_idx = 2;
+  repeated float vector = 3;
+  uint32 k = 4;
+  uint32 ef_search = 5;
+}
+
+message ReplicaScored {
+  uint64 id = 1;
+  float score = 2;
+  bytes payload = 3;
+}
+
+message ReplicaSearchResponse {
+  repeated ReplicaScored results = 1;
+}
+
+service QuorvecInternal {
+  // Metadata-plane Raft transport.
+  rpc RaftRpc(RaftEnvelope) returns (RaftReply);
+
+  // Data-plane replica operations (M4).
+  rpc ReplicaWrite(ReplicaWriteRequest) returns (ReplicaWriteResponse);
+  rpc ReplicaGet(ReplicaGetRequest) returns (ReplicaGetResponse);
+  rpc ReplicaSearch(ReplicaSearchRequest) returns (ReplicaSearchResponse);
+}

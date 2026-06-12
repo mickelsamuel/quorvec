@@ -146,6 +146,25 @@ impl Client {
         Ok(resp.into_inner())
     }
 
+    /// Admit a node to the cluster (metadata-plane admin op). The target is
+    /// `node_id@host:port`. Must be sent to (or forwarded to) the Raft leader.
+    /// Returns the admitted node id.
+    pub async fn join(&mut self, target: &str) -> Result<u64, ClientError> {
+        let resp = self
+            .inner
+            .join(v1::JoinRequest {
+                advertise_addr: target.to_string(),
+            })
+            .await?;
+        Ok(resp.into_inner().node_id)
+    }
+
+    /// Remove a node from the cluster (metadata-plane admin op).
+    pub async fn leave(&mut self, node_id: u64) -> Result<(), ClientError> {
+        self.inner.leave(v1::LeaveRequest { node_id }).await?;
+        Ok(())
+    }
+
     /// Health probe.
     pub async fn health(&mut self) -> Result<String, ClientError> {
         let resp = self.inner.health(v1::HealthRequest {}).await?;

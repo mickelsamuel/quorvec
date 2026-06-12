@@ -1,18 +1,21 @@
 //! The quorvec node binary.
 //!
-//! M0: single-node gRPC server over an in-memory brute-force index. Run with a
-//! TOML config (`qv-node --config node.toml`) or with inline flags
-//! (`qv-node --node-id 1 --listen 127.0.0.1:7000 --data-dir ./data`).
+//! M3: a cluster node. The metadata plane is openraft-backed; the data plane is
+//! durable shards. One listen port serves both the v1 client service and the
+//! internal node-to-node service.
+//!
+//! Run the seed node with `--bootstrap` to form a new single-node cluster; start
+//! the others without it and `Join` them via the admin RPC (the integration
+//! harness does this). Config via `--config node.toml` or inline flags.
 
-use qv_node::config::NodeConfig;
-use qv_node::service::QuorvecService;
-use qv_node::store::Store;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tonic::transport::Server;
+use std::time::Duration;
 
-use qv_proto::QuorvecServer;
+use qv_node::config::NodeConfig;
+use qv_node::{build_node_state, InternalService, QuorvecService};
+use qv_proto::{QuorvecInternalServer, QuorvecServer};
+use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,23 +26,71 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = parse_args()?;
+    let opts = parse_args()?;
+    let cfg = opts.config;
     cfg.validate()?;
-
     std::fs::create_dir_all(&cfg.data_dir)?;
 
-    let store = Arc::new(Store::new());
-    let svc = QuorvecService::new(store, cfg.node_id, cfg.advertise().to_string());
+    let state = build_node_state(&cfg).await?;
 
     tracing::info!(
         node_id = cfg.node_id,
         listen = %cfg.listen_addr,
+        advertise = %cfg.advertise(),
         data_dir = %cfg.data_dir.display(),
-        "quorvec node starting (M0 single-node)"
+        bootstrap = opts.bootstrap,
+        "quorvec node starting (M3 cluster)"
     );
 
+    if opts.bootstrap {
+        // Form a new single-node cluster with this node as the founding leader.
+        state.cluster.bootstrap().await?;
+        tracing::info!(node_id = cfg.node_id, "bootstrapped single-node cluster");
+    }
+
+    let v1 = QuorvecService::new(state.clone());
+    let internal = InternalService::new(state.clone());
+
+    // If this is the seed and join targets were given, admit each peer once it is
+    // healthy. This lets `docker compose up` form a cluster with no extra tooling:
+    // the seed bootstraps, then joins the listed nodes (id@host:port) through Raft.
+    if opts.bootstrap && !opts.join_targets.is_empty() {
+        let cluster = state.cluster.clone();
+        let targets = opts.join_targets.clone();
+        tokio::spawn(async move {
+            for target in targets {
+                if let Some((id, addr)) = target.split_once('@') {
+                    let id: u64 = match id.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::error!(%target, "bad join target (want id@host:port)");
+                            continue;
+                        }
+                    };
+                    // Wait for the peer's internal port to accept connections,
+                    // then add it through Raft. Retry until it succeeds.
+                    for attempt in 0..120u32 {
+                        match cluster.join_node(id, addr.to_string()).await {
+                            Ok(()) => {
+                                tracing::info!(node_id = id, %addr, "joined peer");
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt % 10 == 0 {
+                                    tracing::warn!(node_id = id, %addr, err = %e, "join retry");
+                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     Server::builder()
-        .add_service(QuorvecServer::new(svc))
+        .add_service(QuorvecServer::new(v1))
+        .add_service(QuorvecInternalServer::new(internal))
         .serve_with_shutdown(cfg.listen_addr, shutdown_signal())
         .await?;
 
@@ -47,8 +98,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse either `--config <path>` or inline flags into a [`NodeConfig`].
-fn parse_args() -> anyhow::Result<NodeConfig> {
+/// Parsed launch options.
+struct LaunchOpts {
+    config: NodeConfig,
+    bootstrap: bool,
+    /// Seed-only: peers to admit after bootstrap, each `id@host:port`.
+    join_targets: Vec<String>,
+}
+
+/// Parse `--config <path>` or inline flags, plus `--bootstrap` and
+/// `--join` (repeatable / comma-separated `id@host:port` targets).
+fn parse_args() -> anyhow::Result<LaunchOpts> {
     let mut args = std::env::args().skip(1);
 
     let mut config_path: Option<PathBuf> = None;
@@ -56,6 +116,8 @@ fn parse_args() -> anyhow::Result<NodeConfig> {
     let mut listen: Option<SocketAddr> = None;
     let mut advertise: Option<SocketAddr> = None;
     let mut data_dir: Option<PathBuf> = None;
+    let mut bootstrap = false;
+    let mut join_targets: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -64,6 +126,13 @@ fn parse_args() -> anyhow::Result<NodeConfig> {
             "--listen" => listen = Some(next_val(&mut args, "--listen")?.parse()?),
             "--advertise" => advertise = Some(next_val(&mut args, "--advertise")?.parse()?),
             "--data-dir" => data_dir = Some(next_val(&mut args, "--data-dir")?.into()),
+            "--bootstrap" => bootstrap = true,
+            "--join" => {
+                let v = next_val(&mut args, "--join")?;
+                for t in v.split(',').filter(|s| !s.is_empty()) {
+                    join_targets.push(t.to_string());
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -72,28 +141,33 @@ fn parse_args() -> anyhow::Result<NodeConfig> {
         }
     }
 
-    if let Some(path) = config_path {
-        return Ok(NodeConfig::from_file(path)?);
-    }
+    let config = if let Some(path) = config_path {
+        NodeConfig::from_file(path)?
+    } else {
+        let listen = listen.ok_or_else(|| {
+            anyhow::anyhow!("either --config or --listen (with --node-id, --data-dir) is required")
+        })?;
+        let toml = format!(
+            "node_id = {}\nlisten_addr = \"{}\"\ndata_dir = \"{}\"\n{}",
+            node_id.unwrap_or(1),
+            listen,
+            data_dir
+                .unwrap_or_else(|| PathBuf::from("./qv-data"))
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+            advertise
+                .map(|a| format!("advertise_addr = \"{a}\"\n"))
+                .unwrap_or_default(),
+        );
+        toml::from_str(&toml)?
+    };
 
-    // Inline-flag path: build a config with defaults for the cluster fields.
-    let listen = listen.ok_or_else(|| {
-        anyhow::anyhow!("either --config or --listen (with --node-id, --data-dir) is required")
-    })?;
-    let toml = format!(
-        "node_id = {}\nlisten_addr = \"{}\"\ndata_dir = \"{}\"\n{}",
-        node_id.unwrap_or(1),
-        listen,
-        data_dir
-            .unwrap_or_else(|| PathBuf::from("./qv-data"))
-            .display()
-            .to_string()
-            .replace('\\', "/"),
-        advertise
-            .map(|a| format!("advertise_addr = \"{a}\"\n"))
-            .unwrap_or_default(),
-    );
-    Ok(toml::from_str(&toml)?)
+    Ok(LaunchOpts {
+        config,
+        bootstrap,
+        join_targets,
+    })
 }
 
 fn next_val(args: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
@@ -103,15 +177,17 @@ fn next_val(args: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Resu
 
 fn print_usage() {
     println!(
-        "quorvec node (M0)\n\n\
+        "quorvec node (M3)\n\n\
          USAGE:\n  \
-         qv-node --config <path.toml>\n  \
-         qv-node --node-id <id> --listen <addr> [--advertise <addr>] [--data-dir <dir>]\n\n\
+         qv-node --config <path.toml> [--bootstrap] [--join id@host:port,...]\n  \
+         qv-node --node-id <id> --listen <addr> [--advertise <addr>] [--data-dir <dir>] [--bootstrap] [--join ...]\n\n\
+         --bootstrap forms a new single-node cluster (the seed node). Peers can be\n\
+         admitted by the Join admin RPC, or — on the seed — listed with --join\n\
+         (id@host:port, comma-separated) so the seed admits them once healthy.\n\
          Set RUST_LOG to control log level (default: info)."
     );
 }
 
-/// Resolve on Ctrl-C so the server shuts down cleanly.
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");

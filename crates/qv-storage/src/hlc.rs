@@ -47,6 +47,80 @@ impl Hlc {
     }
 }
 
+/// A monotonic hybrid-logical-clock generator.
+///
+/// `now()` returns a strictly increasing [`Hlc`]: it tracks the max of wall-clock
+/// milliseconds and the last issued timestamp, bumping the 16-bit counter when
+/// the wall clock has not advanced since the last call (and carrying into the
+/// wall component if the counter saturates). M4's coordinator advances this on
+/// receiving a peer's timestamp (`update`), giving the full HLC; M3 uses `now()`
+/// for a locally-monotonic version stamp on the single-replica write path.
+#[derive(Debug)]
+pub struct HlcClock {
+    last: std::sync::Mutex<Hlc>,
+}
+
+impl Default for HlcClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HlcClock {
+    pub fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(Hlc::ZERO),
+        }
+    }
+
+    fn wall_now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            & 0xFFFF_FFFF_FFFF
+    }
+
+    /// Issue the next strictly-increasing timestamp.
+    pub fn now(&self) -> Hlc {
+        let mut last = self.last.lock().unwrap();
+        let wall = Self::wall_now_ms();
+        let next = if wall > last.wall_ms {
+            Hlc::new(wall, 0)
+        } else {
+            // Wall clock did not advance: bump the counter (carry into wall if it
+            // saturates so the result still strictly increases).
+            match last.counter.checked_add(1) {
+                Some(c) => Hlc::new(last.wall_ms, c),
+                None => Hlc::new(last.wall_ms + 1, 0),
+            }
+        };
+        *last = next;
+        next
+    }
+
+    /// Advance the clock on receiving a remote timestamp, then issue a new local
+    /// timestamp strictly greater than both local and remote (the HLC receive
+    /// rule). Used by M4's replica write path.
+    pub fn update(&self, remote: Hlc) -> Hlc {
+        let mut last = self.last.lock().unwrap();
+        let wall = Self::wall_now_ms();
+        let max_wall = wall.max(last.wall_ms).max(remote.wall_ms);
+        let next = if max_wall == last.wall_ms && max_wall == remote.wall_ms {
+            Hlc::new(max_wall, last.counter.max(remote.counter).saturating_add(1))
+        } else if max_wall == last.wall_ms {
+            Hlc::new(max_wall, last.counter.saturating_add(1))
+        } else if max_wall == remote.wall_ms {
+            Hlc::new(max_wall, remote.counter.saturating_add(1))
+        } else {
+            Hlc::new(max_wall, 0)
+        };
+        *last = next;
+        next
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +140,27 @@ mod tests {
         assert!(b < c);
         assert!(a.pack() < b.pack());
         assert!(b.pack() < c.pack());
+    }
+
+    #[test]
+    fn clock_is_strictly_monotonic() {
+        let clock = HlcClock::new();
+        let mut prev = Hlc::ZERO;
+        for _ in 0..10_000 {
+            let t = clock.now();
+            assert!(t > prev, "HLC not strictly increasing: {t:?} !> {prev:?}");
+            prev = t;
+        }
+    }
+
+    #[test]
+    fn update_dominates_remote() {
+        let clock = HlcClock::new();
+        let local = clock.now();
+        // A remote timestamp far in the future.
+        let remote = Hlc::new(local.wall_ms + 1000, 50);
+        let after = clock.update(remote);
+        assert!(after > remote, "update must exceed remote");
+        assert!(after > local, "update must exceed prior local");
     }
 }

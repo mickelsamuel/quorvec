@@ -114,7 +114,8 @@ fn parse_args() -> anyhow::Result<LaunchOpts> {
     let mut config_path: Option<PathBuf> = None;
     let mut node_id: Option<u64> = None;
     let mut listen: Option<SocketAddr> = None;
-    let mut advertise: Option<SocketAddr> = None;
+    // advertise is a host:port string (may be a hostname), not a SocketAddr.
+    let mut advertise: Option<String> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut bootstrap = false;
     let mut join_targets: Vec<String> = Vec::new();
@@ -124,7 +125,7 @@ fn parse_args() -> anyhow::Result<LaunchOpts> {
             "--config" => config_path = Some(next_val(&mut args, "--config")?.into()),
             "--node-id" => node_id = Some(next_val(&mut args, "--node-id")?.parse()?),
             "--listen" => listen = Some(next_val(&mut args, "--listen")?.parse()?),
-            "--advertise" => advertise = Some(next_val(&mut args, "--advertise")?.parse()?),
+            "--advertise" => advertise = Some(next_val(&mut args, "--advertise")?),
             "--data-dir" => data_dir = Some(next_val(&mut args, "--data-dir")?.into()),
             "--bootstrap" => bootstrap = true,
             "--join" => {

@@ -9,7 +9,9 @@
 //! oracle.
 
 pub mod distance;
+pub mod hnsw;
 pub mod index;
 
 pub use distance::Metric;
+pub use hnsw::{HnswIndex, HnswParams};
 pub use index::{BruteForceIndex, IndexError, VectorIndex};

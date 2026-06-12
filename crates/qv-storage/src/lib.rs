@@ -1,7 +1,17 @@
 //! `qv-storage` — durability for a single shard: WAL, snapshots, recovery.
 //!
-//! M2 implements the append-only WAL, snapshotting, and restart recovery here.
-//! Until then this crate is an intentionally empty placeholder so the workspace
-//! layout matches the plan.
+//! - [`hlc`]: the hybrid logical clock timestamp used as the per-point version.
+//! - [`wal`]: the append-only, CRC-checked, torn-tail-safe write-ahead log.
+//! - [`snapshot`]: atomic point-in-time index images + covered WAL offset.
+//! - [`shard`]: the durable shard tying index + WAL + snapshots together, with
+//!   crash recovery on open.
 
-// M2 modules land here (wal, snapshot, shard store, recovery).
+pub mod hlc;
+pub mod shard;
+pub mod snapshot;
+pub mod wal;
+
+pub use hlc::Hlc;
+pub use shard::{Shard, ShardError};
+pub use snapshot::Snapshot;
+pub use wal::{Wal, WalError, WalOp, WalRecord};

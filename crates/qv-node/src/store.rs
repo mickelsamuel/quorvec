@@ -6,7 +6,7 @@
 //! replication, and durability are added in later milestones; here a collection
 //! is a single logical shard living entirely in this node's memory.
 
-use qv_hnsw::{BruteForceIndex, Metric, VectorIndex};
+use qv_hnsw::{HnswIndex, Metric, VectorIndex};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -31,10 +31,10 @@ pub struct Collection {
 
 impl Collection {
     fn new(schema: CollectionSchema) -> Self {
-        // M0 uses the brute-force exact index. M1 swaps this for HNSW behind the
-        // same `VectorIndex` trait with no change to the service layer.
+        // M1: the live index is the owned HNSW graph behind the `VectorIndex`
+        // trait. The brute-force exact index remains the recall oracle in tests.
         let index: Box<dyn VectorIndex> =
-            Box::new(BruteForceIndex::new(schema.dim as usize, schema.metric));
+            Box::new(HnswIndex::new(schema.dim as usize, schema.metric));
         Self {
             schema,
             index: RwLock::new(index),

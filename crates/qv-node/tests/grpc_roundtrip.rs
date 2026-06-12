@@ -1,6 +1,13 @@
-//! M0 acceptance: boot the node over a real gRPC channel, create a collection,
-//! upsert 1k random vectors, and verify exact search returns the true nearest
-//! neighbor — cross-checked in-test against an independent brute-force scan.
+//! End-to-end gRPC acceptance: boot the node over a real gRPC channel, create a
+//! collection, upsert 1k random vectors, and verify search results against an
+//! independent in-test brute-force oracle.
+//!
+//! Through M0 the node used the exact brute-force index, so this asserted exact
+//! top-10 equality. From M1 the node serves an approximate HNSW index behind the
+//! same trait, so the search assertion is recall-based (recall@10 >= 0.95 over
+//! the query set) while Get/Delete remain exact (they do not depend on the ANN
+//! approximation). The data is a clustered Gaussian mixture — representative of
+//! real embeddings, where ef_search=64 yields high recall.
 
 use qv_client::Client;
 use qv_hnsw::{BruteForceIndex, Metric, VectorIndex};
@@ -42,11 +49,27 @@ async fn start_test_server() -> SocketAddr {
     addr
 }
 
+/// A clustered Gaussian-mixture sample generator (50 centers) so the in-node
+/// HNSW index has the cluster structure real embeddings have.
+fn clustered(rng: &mut StdRng, dim: usize, centers: &[Vec<f32>]) -> Vec<f32> {
+    let ci = rng.gen_range(0..centers.len());
+    (0..dim)
+        .map(|d| {
+            // Box-Muller gaussian noise around the chosen center.
+            let u1: f32 = rng.gen::<f32>().max(1e-7);
+            let u2: f32 = rng.gen::<f32>();
+            let g = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+            centers[ci][d] + g * 0.35
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn create_upsert_1k_search_exact() {
+async fn create_upsert_1k_search_recall() {
     const DIM: usize = 64;
     const N: u64 = 1000;
     const SEED: u64 = 0xC0FFEE;
+    const QUERIES: usize = 50;
 
     let addr = start_test_server().await;
     let mut client = Client::connect(format!("http://{addr}")).await.unwrap();
@@ -59,12 +82,16 @@ async fn create_upsert_1k_search_exact() {
         .await
         .unwrap();
 
-    // Generate 1k random vectors, keep a local copy for the oracle.
+    // Generate 1k clustered vectors, keep a local copy for the oracle.
     let mut rng = StdRng::seed_from_u64(SEED);
+    let centers: Vec<Vec<f32>> = (0..50)
+        .map(|_| (0..DIM).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect())
+        .collect();
+
     let mut oracle = BruteForceIndex::new(DIM, Metric::L2);
     let mut points = Vec::with_capacity(N as usize);
     for id in 0..N {
-        let v: Vec<f32> = (0..DIM).map(|_| rng.gen::<f32>()).collect();
+        let v = clustered(&mut rng, DIM, &centers);
         oracle.insert(id, &v).unwrap();
         points.push(v1::Point {
             id,
@@ -79,9 +106,11 @@ async fn create_upsert_1k_search_exact() {
         .unwrap();
     assert_eq!(upserted, N);
 
-    // Run 50 random queries; the server's top-10 must match the in-test oracle.
-    for _ in 0..50 {
-        let q: Vec<f32> = (0..DIM).map(|_| rng.gen::<f32>()).collect();
+    // Run queries; accumulate recall@10 of the server (HNSW) vs the oracle.
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for _ in 0..QUERIES {
+        let q = clustered(&mut rng, DIM, &centers);
 
         let server_hits = client.search("vectors", q.clone(), 10, 64).await.unwrap();
         let oracle_hits = oracle.search(&q, 10, 64).unwrap();
@@ -89,27 +118,33 @@ async fn create_upsert_1k_search_exact() {
         assert_eq!(server_hits.len(), 10);
         assert_eq!(oracle_hits.len(), 10);
 
-        // The nearest neighbor must agree exactly.
-        assert_eq!(
-            server_hits[0].id, oracle_hits[0].0,
-            "server nearest != oracle nearest"
-        );
-
-        // The full top-10 id set must match (exact index, deterministic order).
-        let server_ids: Vec<u64> = server_hits.iter().map(|h| h.id).collect();
         let oracle_ids: Vec<u64> = oracle_hits.iter().map(|h| h.0).collect();
-        assert_eq!(server_ids, oracle_ids, "top-10 ordering mismatch");
+        for sh in &server_hits {
+            if oracle_ids.contains(&sh.id) {
+                hits += 1;
+            }
+        }
+        total += oracle_hits.len();
 
-        // Scores must match the oracle distances within fp tolerance.
-        for (sh, oh) in server_hits.iter().zip(oracle_hits.iter()) {
-            assert!(
-                (sh.score - oh.1).abs() <= 1e-3 * oh.1.max(1.0),
-                "score mismatch: server {} vs oracle {}",
-                sh.score,
-                oh.1
-            );
+        // Scores returned by the server are the true metric distances for the
+        // ids it returned, so each must match the oracle distance for that id.
+        // Compute the full exact ranking once for lookup.
+        let full = oracle.search(&q, N as usize, 64).unwrap();
+        for sh in &server_hits {
+            if let Some((_, d)) = full.iter().find(|(id, _)| *id == sh.id) {
+                assert!(
+                    (sh.score - d).abs() <= 1e-3 * d.max(1.0),
+                    "score mismatch for id {}: server {} vs oracle {}",
+                    sh.id,
+                    sh.score,
+                    d
+                );
+            }
         }
     }
+    let recall = hits as f64 / total as f64;
+    println!("E2E gRPC recall@10 (HNSW, clustered 1k/{QUERIES}, dim={DIM}): {recall:.4}");
+    assert!(recall >= 0.95, "end-to-end recall@10 = {recall:.4} < 0.95");
 
     // Get returns the exact stored vector for an id.
     let got = client

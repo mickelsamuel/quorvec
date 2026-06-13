@@ -14,10 +14,34 @@ use crate::hlc::Hlc;
 use crate::snapshot::Snapshot;
 use crate::wal::{Wal, WalOp, WalRecord};
 use qv_hnsw::{HnswIndex, Metric, VectorIndex};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const WAL_FILE: &str = "shard.wal";
 const SNAPSHOT_FILE: &str = "shard.snap";
+
+/// The per-point version a shard tracks for last-writer-wins (M4).
+///
+/// Every id the shard has ever seen carries its winning [`Hlc`] and whether the
+/// winner was a delete (tombstone). Incoming writes with an HLC `<=` the stored
+/// one are rejected as stale; ties break deterministically by HLC (which already
+/// embeds the node-id-free counter — the coordinator's stamp is globally
+/// ordered). A tombstone keeps its HLC so a later-but-equal resurrection cannot
+/// silently win.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointVersion {
+    pub hlc: Hlc,
+    pub tombstone: bool,
+}
+
+/// The outcome of applying a versioned write to a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The write won LWW and was applied (durable).
+    Applied,
+    /// The write lost LWW (stored HLC was `>=` incoming) and was ignored.
+    Stale,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -39,6 +63,8 @@ pub struct Shard {
     dim: usize,
     metric: Metric,
     index: HnswIndex,
+    /// Per-id winning version (HLC + tombstone) for last-writer-wins (M4).
+    versions: HashMap<u64, PointVersion>,
     wal: Wal,
     /// Snapshot when the WAL since the last snapshot exceeds this many bytes.
     snapshot_threshold_bytes: u64,
@@ -63,28 +89,42 @@ impl Shard {
         let wal_path = dir.join(WAL_FILE);
         let snap_path = dir.join(SNAPSHOT_FILE);
 
-        // 1. Load snapshot (rebuilds index + tells us the covered WAL offset).
-        let (mut index, snap_offset) = match Snapshot::load(&snap_path)? {
-            Some(s) => (s.index, s.wal_offset),
-            None => (HnswIndex::new(dim, metric), 0),
+        // 1. Load snapshot (rebuilds index + versions + the covered WAL offset).
+        let (mut index, mut versions, snap_offset) = match Snapshot::load(&snap_path)? {
+            Some(s) => {
+                let versions: HashMap<u64, PointVersion> = s
+                    .versions
+                    .into_iter()
+                    .map(|(id, v)| {
+                        (
+                            id,
+                            PointVersion {
+                                hlc: v.hlc,
+                                tombstone: v.tombstone,
+                            },
+                        )
+                    })
+                    .collect();
+                (s.index, versions, s.wal_offset)
+            }
+            None => (HnswIndex::new(dim, metric), HashMap::new(), 0),
         };
 
         // 2. WAL recovery: truncates any torn tail, returns surviving records.
         let (records, wal_end) = Wal::recover(&wal_path)?;
 
-        // 3. Replay only records beyond the snapshot offset. We replay by record
-        //    index rather than byte offset: the snapshot offset is a byte offset,
-        //    so we re-walk and apply records whose cumulative end exceeds it.
-        //    Simpler and equally correct: rebuild from snapshot, then apply every
-        //    surviving record whose effect is not already in the snapshot. Since
-        //    a snapshot's index already includes all records up to snap_offset,
-        //    we must skip those. We track byte position to decide.
+        // 3. Replay only records beyond the snapshot offset. The snapshot already
+        //    reflects all writes up to snap_offset (index AND versions), so we
+        //    re-walk and apply only records whose cumulative end exceeds it. The
+        //    WAL is the LWW source of truth: replaying it reproduces the same
+        //    winner set the live path produced (records are appended in the order
+        //    the shard accepted them, so a stale write was never appended).
         let mut pos: u64 = 0;
         for rec in &records {
             let rec_len = framed_len(rec);
             let rec_end = pos + rec_len;
             if rec_end > snap_offset {
-                apply_to_index(&mut index, rec).map_err(ShardError::Index)?;
+                apply_record(&mut index, &mut versions, rec).map_err(ShardError::Index)?;
             }
             pos = rec_end;
         }
@@ -98,6 +138,7 @@ impl Shard {
             dim,
             metric,
             index,
+            versions,
             wal,
             snapshot_threshold_bytes: snapshot_wal_mb.saturating_mul(1024 * 1024),
             last_snapshot_offset: snap_offset,
@@ -121,6 +162,68 @@ impl Shard {
     }
 
     /// Durable upsert: WAL first (fsync by default), then index.
+    ///
+    /// Last-writer-wins by HLC: if a strictly-greater HLC is already stored for
+    /// `id`, the write is ignored as stale (returns [`WriteOutcome::Stale`]) and
+    /// nothing is appended. Otherwise it wins, is appended, applied to the index,
+    /// and recorded as the id's version. (Backward-compatible callers that don't
+    /// care about LWW can use the legacy `upsert` wrapper below.)
+    pub fn upsert_versioned(
+        &mut self,
+        hlc: Hlc,
+        id: u64,
+        vector: &[f32],
+        payload: Vec<u8>,
+    ) -> Result<WriteOutcome, ShardError> {
+        if vector.len() != self.dim {
+            return Err(ShardError::DimMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
+        }
+        if self.is_stale(id, hlc) {
+            return Ok(WriteOutcome::Stale);
+        }
+        let rec = WalRecord::upsert(hlc, id, vector.to_vec(), payload);
+        self.wal.append(&rec)?;
+        self.index
+            .insert(id, vector)
+            .map_err(|e| ShardError::Index(e.to_string()))?;
+        self.versions.insert(
+            id,
+            PointVersion {
+                hlc,
+                tombstone: false,
+            },
+        );
+        self.maybe_snapshot()?;
+        Ok(WriteOutcome::Applied)
+    }
+
+    /// Durable delete (tombstone) with LWW: a stale delete is ignored. A winning
+    /// delete tombstones the id (kept as a versioned tombstone so a later-equal
+    /// resurrection cannot silently win).
+    pub fn delete_versioned(&mut self, hlc: Hlc, id: u64) -> Result<WriteOutcome, ShardError> {
+        if self.is_stale(id, hlc) {
+            return Ok(WriteOutcome::Stale);
+        }
+        let rec = WalRecord::delete(hlc, id);
+        self.wal.append(&rec)?;
+        self.index.delete(id);
+        self.versions.insert(
+            id,
+            PointVersion {
+                hlc,
+                tombstone: true,
+            },
+        );
+        self.maybe_snapshot()?;
+        Ok(WriteOutcome::Applied)
+    }
+
+    /// Legacy unconditional upsert (pre-M4). Stamps the version with `hlc` but
+    /// does not enforce LWW; retained for single-node/test callers. New
+    /// data-plane code uses [`upsert_versioned`].
     pub fn upsert(
         &mut self,
         hlc: Hlc,
@@ -139,17 +242,45 @@ impl Shard {
         self.index
             .insert(id, vector)
             .map_err(|e| ShardError::Index(e.to_string()))?;
+        self.versions.insert(
+            id,
+            PointVersion {
+                hlc,
+                tombstone: false,
+            },
+        );
         self.maybe_snapshot()?;
         Ok(())
     }
 
-    /// Durable delete (tombstone): WAL first, then index.
+    /// Legacy unconditional delete (pre-M4). New code uses [`delete_versioned`].
     pub fn delete(&mut self, hlc: Hlc, id: u64) -> Result<bool, ShardError> {
         let rec = WalRecord::delete(hlc, id);
         self.wal.append(&rec)?;
         let removed = self.index.delete(id);
+        self.versions.insert(
+            id,
+            PointVersion {
+                hlc,
+                tombstone: true,
+            },
+        );
         self.maybe_snapshot()?;
         Ok(removed)
+    }
+
+    /// Whether an incoming `hlc` for `id` loses LWW against the stored version
+    /// (stored HLC `>=` incoming). A first write for an id is never stale.
+    fn is_stale(&self, id: u64, hlc: Hlc) -> bool {
+        match self.versions.get(&id) {
+            Some(v) => hlc <= v.hlc,
+            None => false,
+        }
+    }
+
+    /// The stored version (HLC + tombstone) for an id, if the shard has seen it.
+    pub fn version(&self, id: u64) -> Option<PointVersion> {
+        self.versions.get(&id).copied()
     }
 
     /// k-NN search over the live index.
@@ -180,7 +311,20 @@ impl Shard {
         self.wal.flush()?;
         let offset = self.wal.offset();
         let snap_path = self.dir.join(SNAPSHOT_FILE);
-        Snapshot::write(&snap_path, offset, &self.index)?;
+        let versions = self
+            .versions
+            .iter()
+            .map(|(id, v)| {
+                (
+                    *id,
+                    crate::snapshot::VersionEntry {
+                        hlc: v.hlc,
+                        tombstone: v.tombstone,
+                    },
+                )
+            })
+            .collect();
+        Snapshot::write(&snap_path, offset, &self.index, &versions)?;
         self.last_snapshot_offset = offset;
         Ok(())
     }
@@ -198,12 +342,46 @@ impl Shard {
     }
 }
 
-/// Apply a recovered WAL record to the in-memory index.
-fn apply_to_index(index: &mut HnswIndex, rec: &WalRecord) -> Result<(), String> {
+/// Apply a recovered WAL record to the in-memory index AND the version map.
+///
+/// The WAL is the LWW source of truth: records were only appended when they won
+/// (the live path never appends a stale write), so replaying in WAL order
+/// reproduces the same winner set. We still take the max HLC per id defensively,
+/// so a hand-constructed/out-of-order log still converges to the highest HLC.
+fn apply_record(
+    index: &mut HnswIndex,
+    versions: &mut HashMap<u64, PointVersion>,
+    rec: &WalRecord,
+) -> Result<(), String> {
+    // Skip if a strictly-greater version is already present (defensive LWW).
+    if let Some(v) = versions.get(&rec.id) {
+        if rec.hlc < v.hlc {
+            return Ok(());
+        }
+    }
     match rec.op {
-        WalOp::Upsert => index.insert(rec.id, &rec.vector).map_err(|e| e.to_string()),
+        WalOp::Upsert => {
+            index
+                .insert(rec.id, &rec.vector)
+                .map_err(|e| e.to_string())?;
+            versions.insert(
+                rec.id,
+                PointVersion {
+                    hlc: rec.hlc,
+                    tombstone: false,
+                },
+            );
+            Ok(())
+        }
         WalOp::Delete => {
             index.delete(rec.id);
+            versions.insert(
+                rec.id,
+                PointVersion {
+                    hlc: rec.hlc,
+                    tombstone: true,
+                },
+            );
             Ok(())
         }
     }
@@ -226,6 +404,119 @@ mod tests {
 
     fn h(n: u64) -> Hlc {
         Hlc::new(n, 0)
+    }
+
+    #[test]
+    fn lww_rejects_stale_and_keeps_winner() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("lww");
+        let mut shard = Shard::open(&p, 2, Metric::L2, 128, 0).unwrap();
+
+        // Winner at hlc=10.
+        assert_eq!(
+            shard
+                .upsert_versioned(h(10), 1, &[1.0, 1.0], vec![])
+                .unwrap(),
+            WriteOutcome::Applied
+        );
+        // A lower-hlc write loses LWW and is ignored.
+        assert_eq!(
+            shard
+                .upsert_versioned(h(5), 1, &[9.0, 9.0], vec![])
+                .unwrap(),
+            WriteOutcome::Stale
+        );
+        // The stored vector is still the hlc=10 winner.
+        assert_eq!(shard.get(1), Some(vec![1.0, 1.0]));
+        assert_eq!(shard.version(1).unwrap().hlc, h(10));
+
+        // A higher-hlc write wins and replaces.
+        assert_eq!(
+            shard
+                .upsert_versioned(h(20), 1, &[2.0, 2.0], vec![])
+                .unwrap(),
+            WriteOutcome::Applied
+        );
+        assert_eq!(shard.get(1), Some(vec![2.0, 2.0]));
+        assert_eq!(shard.version(1).unwrap().hlc, h(20));
+
+        // An equal-hlc write is NOT newer -> stale (deterministic, no flapping).
+        assert_eq!(
+            shard
+                .upsert_versioned(h(20), 1, &[3.0, 3.0], vec![])
+                .unwrap(),
+            WriteOutcome::Stale
+        );
+        assert_eq!(shard.get(1), Some(vec![2.0, 2.0]));
+    }
+
+    #[test]
+    fn lww_tombstone_versioned() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("lww_del");
+        let mut shard = Shard::open(&p, 2, Metric::L2, 128, 0).unwrap();
+
+        shard
+            .upsert_versioned(h(10), 1, &[1.0, 1.0], vec![])
+            .unwrap();
+        // Delete at a higher hlc wins -> tombstone.
+        assert_eq!(
+            shard.delete_versioned(h(20), 1).unwrap(),
+            WriteOutcome::Applied
+        );
+        assert_eq!(shard.get(1), None);
+        assert!(shard.version(1).unwrap().tombstone);
+
+        // A resurrect at a LOWER hlc than the tombstone loses (stays deleted).
+        assert_eq!(
+            shard
+                .upsert_versioned(h(15), 1, &[7.0, 7.0], vec![])
+                .unwrap(),
+            WriteOutcome::Stale
+        );
+        assert_eq!(shard.get(1), None);
+
+        // A resurrect at a HIGHER hlc wins (comes back).
+        assert_eq!(
+            shard
+                .upsert_versioned(h(30), 1, &[7.0, 7.0], vec![])
+                .unwrap(),
+            WriteOutcome::Applied
+        );
+        assert_eq!(shard.get(1), Some(vec![7.0, 7.0]));
+    }
+
+    #[test]
+    fn versions_survive_snapshot_and_recovery() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("ver_recover");
+        {
+            let mut shard = Shard::open(&p, 2, Metric::L2, 128, 0).unwrap();
+            shard
+                .upsert_versioned(h(10), 1, &[1.0, 1.0], vec![])
+                .unwrap();
+            shard
+                .upsert_versioned(h(20), 2, &[2.0, 2.0], vec![])
+                .unwrap();
+            shard.delete_versioned(h(30), 2).unwrap();
+            shard.snapshot_now().unwrap();
+            shard
+                .upsert_versioned(h(40), 3, &[3.0, 3.0], vec![])
+                .unwrap();
+        }
+        // Reopen: versions restored from snapshot + WAL tail; LWW still enforced.
+        let mut shard = Shard::open(&p, 2, Metric::L2, 128, 0).unwrap();
+        assert_eq!(shard.version(1).unwrap().hlc, h(10));
+        assert!(shard.version(2).unwrap().tombstone);
+        assert_eq!(shard.version(2).unwrap().hlc, h(30));
+        assert_eq!(shard.version(3).unwrap().hlc, h(40));
+        // A stale write against the recovered version is still rejected.
+        assert_eq!(
+            shard
+                .upsert_versioned(h(5), 1, &[9.0, 9.0], vec![])
+                .unwrap(),
+            WriteOutcome::Stale
+        );
     }
 
     #[test]
@@ -300,8 +591,9 @@ mod tests {
         // Reference: replay the whole WAL from scratch.
         let (records, _) = Wal::recover(p.join("shard.wal")).unwrap();
         let mut reference = HnswIndex::new(2, Metric::L2);
+        let mut ref_versions = HashMap::new();
         for rec in &records {
-            apply_to_index(&mut reference, rec).unwrap();
+            apply_record(&mut reference, &mut ref_versions, rec).unwrap();
         }
 
         assert_eq!(recovered.len(), reference.len());

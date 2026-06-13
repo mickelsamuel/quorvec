@@ -43,8 +43,17 @@ crc32fast = "1.4"
 
 # Metadata-plane consensus. Pinned to the latest STABLE openraft (0.9.x); the
 # 0.10 line is alpha as of 2026-06. Pre-1.0 API per the plan; storage-v2 splits
-# the log store from the state-machine store.
-openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+# the log store from the state-machine store. `loosen-follower-log-revert` is the
+# documented openraft switch for our in-memory Raft log: a node killed and
+# restarted comes back with an empty log + empty state machine and recovers by
+# the leader replicating a snapshot to it (instead of the leader panicking on the
+# follower's "log reversion"). This is the sanctioned path for a memory log store
+# where nodes can restart empty — it pairs with M3's in-memory-Raft-log decision.
+openraft = { version = "0.9.24", features = [
+    "serde",
+    "storage-v2",
+    "loosen-follower-log-revert",
+] }
 
 # Serialization.
 serde = { version = "1.0", features = ["derive"] }

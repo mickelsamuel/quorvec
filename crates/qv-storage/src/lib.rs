@@ -6,12 +6,14 @@
 //! - [`shard`]: the durable shard tying index + WAL + snapshots together, with
 //!   crash recovery on open.
 
+pub mod hints;
 pub mod hlc;
 pub mod shard;
 pub mod snapshot;
 pub mod wal;
 
+pub use hints::{Hint, HintError, HintLog};
 pub use hlc::{Hlc, HlcClock};
-pub use shard::{Shard, ShardError};
+pub use shard::{PointVersion, Shard, ShardError, WriteOutcome};
 pub use snapshot::Snapshot;
 pub use wal::{Wal, WalError, WalOp, WalRecord};

@@ -1,30 +1,36 @@
-//! Data-plane routing (M3 single-replica; M4 extends this to N/W/R quorum).
+//! Data-plane routing and coordination (M4: tunable quorum replication).
 //!
-//! The coordinator (whichever node received the client request) resolves each
-//! point to its shard via [`qv_cluster::shard_for_id`], looks up the shard's
-//! replica nodes from the metadata shard map, and — for M3 — routes to the
-//! **primary** (the first/home replica). If the primary is this node it applies
-//! locally; otherwise it forwards over the internal `ReplicaWrite/ReplicaGet/
-//! ReplicaSearch` RPCs. Search scatters to one replica per shard and merges a
-//! global top-k.
+//! The coordinator (whichever node received the client request) stamps each
+//! write with an HLC, resolves each point to its shard, and replicates to the
+//! shard's **N replicas**, acking the client at **W** (ONE / QUORUM / ALL). The
+//! locked Dynamo-style semantics:
 //!
-//! M3 deliberately uses single-replica routing (the plan: "single-replica
-//! routing, no quorums yet"). The richer quorum/HLC-LWW/hinted-handoff/read-
-//! repair path is M4; this module's shape (resolve shard -> pick replica(s) ->
-//! local-or-forward) is what M4 generalizes.
-
-use std::collections::HashMap;
+//! - **N/W/R quorum.** N = the shard's replica count; W/R from the consistency
+//!   level (ONE=1, QUORUM=⌊N/2⌋+1, ALL=N).
+//! - **HLC LWW.** Per-point version = the coordinator's HLC; replicas reject a
+//!   write whose HLC is not newer than what they hold ([`qv_storage`] enforces
+//!   this; the coordinator counts an applied-or-superseded replica as a success
+//!   because the data has converged either way).
+//! - **Hinted handoff.** A replica that is unreachable for a write does not block
+//!   the quorum: the coordinator records a durable hint (the op + the target
+//!   replica) on a stand-in node (the next distinct ring node), which replays it
+//!   when the target returns. Hints are WAL-persisted ([`qv_storage::HintLog`]).
+//! - **Get** reads R replicas, LWW-merges by HLC, returns the newest, and async
+//!   **read-repairs** any replica that returned a stale (or missing) version.
+//! - **Search** scatters to one *healthy* replica per shard (falling forward
+//!   through the replica list) and merges a global top-k.
+//! - **Delete** = an HLC-stamped tombstone, replicated exactly like an upsert.
 
 use qv_cluster::{shard_for_id, CollectionSchema, MetaState};
 use qv_proto::internal::{
     ReplicaGetRequest, ReplicaPoint, ReplicaScored, ReplicaSearchRequest, ReplicaWriteRequest,
 };
 use qv_proto::QuorvecInternalClient;
-use qv_storage::Hlc;
+use qv_storage::{Hint, Hlc, WalOp, WriteOutcome};
 use tonic::transport::Channel;
 
 use crate::node_state::NodeState;
-use crate::shards::{metric_from_cluster, ShardRef};
+use crate::shards::{metric_from_cluster, ShardRef, StoredPoint};
 
 /// A routing/coordination error.
 #[derive(Debug, thiserror::Error)]
@@ -35,22 +41,62 @@ pub enum RouterError {
     NoReplica { collection: String, shard_idx: u32 },
     #[error("dimension mismatch: collection is {expected}-d, got {got}-d")]
     DimMismatch { expected: usize, got: usize },
+    #[error("write quorum not met for {collection} shard {shard_idx}: needed {needed}, got {got}")]
+    WriteQuorum {
+        collection: String,
+        shard_idx: u32,
+        needed: usize,
+        got: usize,
+    },
+    #[error("read quorum not met for {collection} shard {shard_idx}: needed {needed}, got {got}")]
+    ReadQuorum {
+        collection: String,
+        shard_idx: u32,
+        needed: usize,
+        got: usize,
+    },
     #[error("shard store: {0}")]
     Shard(#[from] crate::shards::ShardStoreError),
-    #[error("internal transport to {addr}: {source}")]
-    Transport {
-        addr: String,
-        source: tonic::transport::Error,
-    },
-    #[error("internal rpc to {addr}: {source}")]
-    Rpc { addr: String, source: tonic::Status },
+    #[error("hint store: {0}")]
+    Hint(#[from] qv_storage::HintError),
 }
 
-/// WAL op codes shared with the internal proto.
 const OP_UPSERT: u32 = 0;
 const OP_DELETE: u32 = 1;
 
-/// Resolve the metadata snapshot + schema for a collection, erroring if unknown.
+/// The tunable consistency level (mirrors the proto enum), resolved to a replica
+/// count given N.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consistency {
+    One,
+    Quorum,
+    All,
+}
+
+impl Consistency {
+    /// Map the proto enum value to a level (unspecified -> QUORUM, the safe
+    /// default per the locked proto comment).
+    pub fn from_proto(v: i32) -> Self {
+        match v {
+            1 => Consistency::One,    // CONSISTENCY_ONE
+            3 => Consistency::All,    // CONSISTENCY_ALL
+            _ => Consistency::Quorum, // QUORUM or UNSPECIFIED
+        }
+    }
+
+    /// Required ack/read count for a replica set of size `n`.
+    pub fn count(self, n: usize) -> usize {
+        match self {
+            Consistency::One => 1,
+            Consistency::Quorum => n / 2 + 1,
+            Consistency::All => n,
+        }
+        .clamp(1, n.max(1))
+    }
+}
+
+// ---- shared helpers --------------------------------------------------------
+
 async fn schema_of(
     state: &NodeState,
     collection: &str,
@@ -64,16 +110,17 @@ async fn schema_of(
     Ok((meta, schema))
 }
 
-/// The primary (home) replica node id for a shard, plus its advertise address.
-fn primary_for(meta: &MetaState, collection: &str, shard_idx: u32) -> Option<(u64, String)> {
-    let replicas = meta.replicas_for_shard(collection, shard_idx);
-    let primary = *replicas.first()?;
-    let addr = meta.nodes.get(&primary).cloned()?;
-    Some((primary, addr))
+/// The replica node ids for a shard with their advertise addresses, clockwise
+/// from the home (first = primary). Replicas whose address is unknown are
+/// dropped (they cannot be routed to).
+fn replicas_with_addrs(meta: &MetaState, collection: &str, shard_idx: u32) -> Vec<(u64, String)> {
+    meta.replicas_for_shard(collection, shard_idx)
+        .into_iter()
+        .filter_map(|id| meta.nodes.get(&id).map(|a| (id, a.clone())))
+        .collect()
 }
 
-/// Connect an internal client to a peer advertise address.
-async fn internal_client(addr: &str) -> Result<QuorvecInternalClient<Channel>, RouterError> {
+async fn internal_client(addr: &str) -> Result<QuorvecInternalClient<Channel>, ConnError> {
     let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
     } else {
@@ -81,25 +128,84 @@ async fn internal_client(addr: &str) -> Result<QuorvecInternalClient<Channel>, R
     };
     QuorvecInternalClient::connect(endpoint)
         .await
-        .map_err(|source| RouterError::Transport {
-            addr: addr.to_string(),
-            source,
-        })
+        .map_err(|_| ConnError)
 }
 
-/// Coordinate an upsert of `(id, vector, payload)` points into a collection.
-/// Returns the number accepted. M3: each point is stamped with a local HLC and
-/// routed to its shard's primary replica (single replica).
+/// A marker for "could not reach the peer" — drives hinted handoff and
+/// healthy-replica fallback. Distinct from a logical RouterError so the
+/// coordinator can route around it instead of failing.
+struct ConnError;
+
+/// Apply one write to a replica: locally if it's us, else over the internal RPC.
+/// Returns Ok(true) when the data converged at that replica (applied OR a newer
+/// version already present), Ok(false)/Err only on unreachable/transport errors.
+#[allow(clippy::too_many_arguments)]
+async fn write_one_replica(
+    state: &NodeState,
+    node_id: u64,
+    addr: &str,
+    collection: &str,
+    shard_idx: u32,
+    op: u32,
+    id: u64,
+    hlc: Hlc,
+    vector: &[f32],
+    payload: &[u8],
+    schema: &CollectionSchema,
+) -> Result<bool, ConnError> {
+    if node_id == state.node_id {
+        let sref = ShardRef {
+            collection,
+            shard_idx,
+            dim: schema.dim as usize,
+            metric: metric_from_cluster(schema.metric),
+        };
+        let res = if op == OP_DELETE {
+            state.shards.delete(&sref, hlc, id)
+        } else {
+            state
+                .shards
+                .upsert(&sref, hlc, id, vector, payload.to_vec())
+        };
+        // Applied or Stale both mean "converged at this replica".
+        match res {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false), // local error is not "unreachable"; count as not-acked
+        }
+    } else {
+        let mut client = internal_client(addr).await?;
+        client
+            .replica_write(ReplicaWriteRequest {
+                collection: collection.to_string(),
+                shard_idx,
+                op,
+                id,
+                hlc: hlc.pack(),
+                vector: vector.to_vec(),
+                payload: payload.to_vec(),
+            })
+            .await
+            .map_err(|_| ConnError)?;
+        Ok(true)
+    }
+}
+
+// ---- writes (Upsert / Delete) ---------------------------------------------
+
+/// Coordinate an upsert at the given consistency. Each point is HLC-stamped and
+/// replicated to its shard's N replicas; the client is acked once W replicas
+/// converge. Unreachable replicas get a hinted handoff (so the quorum is not
+/// blocked and the write is not lost).
 pub async fn coordinate_upsert(
     state: &NodeState,
     collection: &str,
     points: &[(u64, Vec<f32>, Vec<u8>)],
+    consistency: Consistency,
 ) -> Result<u64, RouterError> {
     let (meta, schema) = schema_of(state, collection).await?;
     let dim = schema.dim as usize;
-    let metric = metric_from_cluster(schema.metric);
-
     let mut accepted = 0u64;
+
     for (id, vector, payload) in points {
         if vector.len() != dim {
             return Err(RouterError::DimMismatch {
@@ -109,170 +215,335 @@ pub async fn coordinate_upsert(
         }
         let shard_idx = shard_for_id(*id, schema.shard_count);
         let hlc = state.clock.now();
-
-        let (primary, addr) =
-            primary_for(&meta, collection, shard_idx).ok_or_else(|| RouterError::NoReplica {
-                collection: collection.to_string(),
-                shard_idx,
-            })?;
-
-        if primary == state.node_id {
-            let sref = ShardRef {
-                collection,
-                shard_idx,
-                dim,
-                metric,
-            };
-            state
-                .shards
-                .upsert(&sref, hlc, *id, vector, payload.clone())?;
-        } else {
-            let mut client = internal_client(&addr).await?;
-            client
-                .replica_write(ReplicaWriteRequest {
-                    collection: collection.to_string(),
-                    shard_idx,
-                    op: OP_UPSERT,
-                    id: *id,
-                    hlc: hlc.pack(),
-                    vector: vector.clone(),
-                    payload: payload.clone(),
-                })
-                .await
-                .map_err(|source| RouterError::Rpc {
-                    addr: addr.clone(),
-                    source,
-                })?;
-        }
+        replicate_write(
+            state,
+            &meta,
+            &schema,
+            collection,
+            shard_idx,
+            OP_UPSERT,
+            *id,
+            hlc,
+            vector,
+            payload,
+            consistency,
+        )
+        .await?;
         accepted += 1;
     }
     Ok(accepted)
 }
 
-/// Coordinate a delete (tombstone) of ids. Returns the count routed.
+/// Coordinate a delete (HLC-stamped tombstone) at the given consistency.
 pub async fn coordinate_delete(
     state: &NodeState,
     collection: &str,
     ids: &[u64],
+    consistency: Consistency,
 ) -> Result<u64, RouterError> {
     let (meta, schema) = schema_of(state, collection).await?;
-    let dim = schema.dim as usize;
-    let metric = metric_from_cluster(schema.metric);
-
     let mut count = 0u64;
+    let empty: Vec<f32> = Vec::new();
     for id in ids {
         let shard_idx = shard_for_id(*id, schema.shard_count);
         let hlc = state.clock.now();
-        let (primary, addr) =
-            primary_for(&meta, collection, shard_idx).ok_or_else(|| RouterError::NoReplica {
-                collection: collection.to_string(),
-                shard_idx,
-            })?;
-        if primary == state.node_id {
-            let sref = ShardRef {
-                collection,
-                shard_idx,
-                dim,
-                metric,
-            };
-            state.shards.delete(&sref, hlc, *id)?;
-        } else {
-            let mut client = internal_client(&addr).await?;
-            client
-                .replica_write(ReplicaWriteRequest {
-                    collection: collection.to_string(),
-                    shard_idx,
-                    op: OP_DELETE,
-                    id: *id,
-                    hlc: hlc.pack(),
-                    vector: Vec::new(),
-                    payload: Vec::new(),
-                })
-                .await
-                .map_err(|source| RouterError::Rpc {
-                    addr: addr.clone(),
-                    source,
-                })?;
-        }
+        replicate_write(
+            state,
+            &meta,
+            &schema,
+            collection,
+            shard_idx,
+            OP_DELETE,
+            *id,
+            hlc,
+            &empty,
+            &[],
+            consistency,
+        )
+        .await?;
         count += 1;
     }
     Ok(count)
 }
 
-/// Coordinate a Get of ids: route each to its shard's primary, collect live
-/// points. M3 reads from the single primary replica (M4 adds R-quorum + merge).
+/// Replicate one write to all N replicas, ack at W, hint the unreachable ones.
+#[allow(clippy::too_many_arguments)]
+async fn replicate_write(
+    state: &NodeState,
+    meta: &MetaState,
+    schema: &CollectionSchema,
+    collection: &str,
+    shard_idx: u32,
+    op: u32,
+    id: u64,
+    hlc: Hlc,
+    vector: &[f32],
+    payload: &[u8],
+    consistency: Consistency,
+) -> Result<(), RouterError> {
+    let replicas = replicas_with_addrs(meta, collection, shard_idx);
+    if replicas.is_empty() {
+        return Err(RouterError::NoReplica {
+            collection: collection.to_string(),
+            shard_idx,
+        });
+    }
+    let n = replicas.len();
+    let w = consistency.count(n);
+
+    let mut acks = 0usize;
+    let mut unreachable: Vec<u64> = Vec::new();
+
+    for (node_id, addr) in &replicas {
+        match write_one_replica(
+            state, *node_id, addr, collection, shard_idx, op, id, hlc, vector, payload, schema,
+        )
+        .await
+        {
+            Ok(true) => acks += 1,
+            Ok(false) => unreachable.push(*node_id),
+            Err(ConnError) => unreachable.push(*node_id),
+        }
+    }
+
+    // Hinted handoff for every replica we couldn't reach: buffer the write on a
+    // stand-in (the next distinct ring node not in the replica set, else this
+    // coordinator) so it can be replayed when the target returns.
+    if !unreachable.is_empty() {
+        let wal_op = if op == OP_DELETE {
+            WalOp::Delete
+        } else {
+            WalOp::Upsert
+        };
+        for target in &unreachable {
+            let hint = Hint {
+                target_node: *target,
+                collection: collection.to_string(),
+                shard_idx,
+                op: wal_op,
+                hlc,
+                id,
+                vector: vector.to_vec(),
+                payload: payload.to_vec(),
+            };
+            // The coordinator is the hint holder: it is up (it is running this
+            // code) and is the natural stand-in. It replays to the target when
+            // the target returns (a "sloppy quorum" — the write is durably
+            // buffered, never lost, and the live quorum is not blocked). Placing
+            // the hint on a different stand-in ring node is a labeled refinement.
+            state.buffer_hint(&hint)?;
+        }
+    }
+
+    if acks >= w {
+        Ok(())
+    } else {
+        Err(RouterError::WriteQuorum {
+            collection: collection.to_string(),
+            shard_idx,
+            needed: w,
+            got: acks,
+        })
+    }
+}
+
+// ---- Get (R-read + LWW merge + async read repair) --------------------------
+
+/// Coordinate a Get at the given read consistency: read R replicas per id,
+/// LWW-merge by HLC, return the live winners, and async-repair stale replicas.
 pub async fn coordinate_get(
     state: &NodeState,
     collection: &str,
     ids: &[u64],
+    consistency: Consistency,
 ) -> Result<Vec<(u64, Vec<f32>)>, RouterError> {
     let (meta, schema) = schema_of(state, collection).await?;
-    let dim = schema.dim as usize;
-    let metric = metric_from_cluster(schema.metric);
-
-    // Group ids by their shard's primary so we batch remote Gets per node.
-    let mut local_ids: Vec<u64> = Vec::new();
-    let mut local_shards: Vec<u32> = Vec::new();
-    // (addr, shard_idx) -> ids
-    let mut remote: HashMap<(String, u32), Vec<u64>> = HashMap::new();
+    let mut out: Vec<(u64, Vec<f32>)> = Vec::new();
 
     for id in ids {
         let shard_idx = shard_for_id(*id, schema.shard_count);
-        let (primary, addr) =
-            primary_for(&meta, collection, shard_idx).ok_or_else(|| RouterError::NoReplica {
+        let replicas = replicas_with_addrs(&meta, collection, shard_idx);
+        if replicas.is_empty() {
+            return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
                 shard_idx,
-            })?;
-        if primary == state.node_id {
-            local_ids.push(*id);
-            local_shards.push(shard_idx);
-        } else {
-            remote.entry((addr, shard_idx)).or_default().push(*id);
+            });
+        }
+        let n = replicas.len();
+        let r = consistency.count(n);
+
+        // Read every reachable replica; collect (node, addr, version).
+        let mut responses: Vec<(u64, String, Option<StoredPoint>)> = Vec::new();
+        for (node_id, addr) in &replicas {
+            if let Ok(opt) =
+                read_one_replica(state, *node_id, addr, collection, shard_idx, *id, &schema).await
+            {
+                responses.push((*node_id, addr.clone(), opt));
+            }
+        }
+        if responses.len() < r {
+            return Err(RouterError::ReadQuorum {
+                collection: collection.to_string(),
+                shard_idx,
+                needed: r,
+                got: responses.len(),
+            });
+        }
+
+        // LWW-merge: highest HLC wins (tombstone or value).
+        let winner = responses
+            .iter()
+            .filter_map(|(_, _, p)| p.clone())
+            .max_by_key(|p| p.hlc);
+
+        if let Some(win) = winner {
+            // Async read repair: push the winner to any replica that returned a
+            // strictly-older version (or nothing). Fire-and-forget.
+            spawn_read_repair(state, collection, shard_idx, &schema, &responses, &win);
+
+            if !win.tombstone {
+                out.push((win.id, win.vector));
+            }
         }
     }
+    Ok(out)
+}
 
-    let mut out: Vec<(u64, Vec<f32>)> = Vec::new();
-
-    // Local reads.
-    for (id, shard_idx) in local_ids.iter().zip(local_shards.iter()) {
+/// Read one replica's versioned point for `id`.
+#[allow(clippy::too_many_arguments)]
+async fn read_one_replica(
+    state: &NodeState,
+    node_id: u64,
+    addr: &str,
+    collection: &str,
+    shard_idx: u32,
+    id: u64,
+    schema: &CollectionSchema,
+) -> Result<Option<StoredPoint>, ConnError> {
+    if node_id == state.node_id {
         let sref = ShardRef {
             collection,
-            shard_idx: *shard_idx,
-            dim,
-            metric,
+            shard_idx,
+            dim: schema.dim as usize,
+            metric: metric_from_cluster(schema.metric),
         };
-        if let Some(v) = state.shards.get(&sref, *id)? {
-            out.push((*id, v));
-        }
-    }
-
-    // Remote reads.
-    for ((addr, shard_idx), batch) in remote {
-        let mut client = internal_client(&addr).await?;
+        state.shards.get_versioned(&sref, id).map_err(|_| ConnError)
+    } else {
+        let mut client = internal_client(addr).await?;
         let resp = client
             .replica_get(ReplicaGetRequest {
                 collection: collection.to_string(),
                 shard_idx,
-                ids: batch,
+                ids: vec![id],
             })
             .await
-            .map_err(|source| RouterError::Rpc {
-                addr: addr.clone(),
-                source,
-            })?
+            .map_err(|_| ConnError)?
             .into_inner();
-        for p in resp.points {
-            if !p.tombstone {
-                out.push((p.id, p.vector));
-            }
-        }
+        Ok(resp.points.into_iter().next().map(|p| StoredPoint {
+            id: p.id,
+            hlc: Hlc::unpack(p.hlc),
+            tombstone: p.tombstone,
+            vector: p.vector,
+            payload: p.payload,
+        }))
     }
-
-    Ok(out)
 }
 
-/// Coordinate a Search: scatter to one replica per shard, gather, merge global
-/// top-k by ascending score (smaller = closer).
+/// Spawn async read repair: push `winner` to replicas that are behind it.
+fn spawn_read_repair(
+    state: &NodeState,
+    collection: &str,
+    shard_idx: u32,
+    schema: &CollectionSchema,
+    responses: &[(u64, String, Option<StoredPoint>)],
+    winner: &StoredPoint,
+) {
+    // Determine the stale replicas (older HLC or missing) synchronously, then
+    // move the work to a task so the read returns promptly.
+    let mut stale: Vec<(u64, String)> = Vec::new();
+    for (node_id, addr, p) in responses {
+        let behind = match p {
+            Some(sp) => sp.hlc < winner.hlc,
+            None => true,
+        };
+        if behind {
+            stale.push((*node_id, addr.clone()));
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+
+    // We cannot move &NodeState into a task; the data-plane repair only needs the
+    // node id (to know "is it me"), the shard store handle, and the internal
+    // client. Since NodeState is held in an Arc by callers, repair runs inline
+    // for the local replica and spawns remote pushes. To keep this synchronous-
+    // safe without threading an Arc here, we apply local repair immediately and
+    // spawn the remote pushes with owned data.
+    let op = if winner.tombstone {
+        OP_DELETE
+    } else {
+        OP_UPSERT
+    };
+    let self_id = state.node_id;
+    let collection = collection.to_string();
+    let dim = schema.dim as usize;
+    let metric = metric_from_cluster(schema.metric);
+    let winner = winner.clone();
+
+    // Local repair (synchronous, cheap).
+    for (node_id, _addr) in stale.iter().filter(|(nid, _)| *nid == self_id) {
+        let _ = *node_id;
+        let sref = ShardRef {
+            collection: &collection,
+            shard_idx,
+            dim,
+            metric,
+        };
+        let _ = if winner.tombstone {
+            state.shards.delete(&sref, winner.hlc, winner.id)
+        } else {
+            state.shards.upsert(
+                &sref,
+                winner.hlc,
+                winner.id,
+                &winner.vector,
+                winner.payload.clone(),
+            )
+        };
+    }
+
+    // Remote repair (spawned, owned).
+    let remote: Vec<(u64, String)> = stale
+        .into_iter()
+        .filter(|(nid, _)| *nid != self_id)
+        .collect();
+    if remote.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for (_node_id, addr) in remote {
+            if let Ok(mut client) = internal_client(&addr).await {
+                let _ = client
+                    .replica_write(ReplicaWriteRequest {
+                        collection: collection.clone(),
+                        shard_idx,
+                        op,
+                        id: winner.id,
+                        hlc: winner.hlc.pack(),
+                        vector: winner.vector.clone(),
+                        payload: winner.payload.clone(),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+// ---- Search (scatter to one healthy replica per shard) ---------------------
+
+/// Coordinate a Search: for each shard, query one *healthy* replica (the first
+/// reachable one, primary-first), then merge a global top-k by ascending score.
 pub async fn coordinate_search(
     state: &NodeState,
     collection: &str,
@@ -282,7 +553,6 @@ pub async fn coordinate_search(
 ) -> Result<Vec<(u64, f32)>, RouterError> {
     let (meta, schema) = schema_of(state, collection).await?;
     let dim = schema.dim as usize;
-    let metric = metric_from_cluster(schema.metric);
     if query.len() != dim {
         return Err(RouterError::DimMismatch {
             expected: dim,
@@ -291,45 +561,38 @@ pub async fn coordinate_search(
     }
 
     let mut merged: Vec<(u64, f32)> = Vec::new();
-
     for shard_idx in 0..schema.shard_count {
-        // M3: one replica per shard = the primary. (M4: one *healthy* replica.)
-        let (primary, addr) =
-            primary_for(&meta, collection, shard_idx).ok_or_else(|| RouterError::NoReplica {
+        let replicas = replicas_with_addrs(&meta, collection, shard_idx);
+        if replicas.is_empty() {
+            return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
                 shard_idx,
-            })?;
-
-        let hits = if primary == state.node_id {
-            let sref = ShardRef {
-                collection,
+            });
+        }
+        // Try replicas in order until one answers (one healthy replica per shard).
+        let mut got = false;
+        for (node_id, addr) in &replicas {
+            match search_one_replica(
+                state, *node_id, addr, collection, shard_idx, query, k, ef_search, &schema,
+            )
+            .await
+            {
+                Ok(hits) => {
+                    merged.extend(hits);
+                    got = true;
+                    break;
+                }
+                Err(ConnError) => continue,
+            }
+        }
+        if !got {
+            return Err(RouterError::NoReplica {
+                collection: collection.to_string(),
                 shard_idx,
-                dim,
-                metric,
-            };
-            state.shards.search_shard(&sref, query, k, ef_search)?
-        } else {
-            let mut client = internal_client(&addr).await?;
-            let resp = client
-                .replica_search(ReplicaSearchRequest {
-                    collection: collection.to_string(),
-                    shard_idx,
-                    vector: query.to_vec(),
-                    k: k as u32,
-                    ef_search: ef_search as u32,
-                })
-                .await
-                .map_err(|source| RouterError::Rpc {
-                    addr: addr.clone(),
-                    source,
-                })?
-                .into_inner();
-            resp.results.into_iter().map(|r| (r.id, r.score)).collect()
-        };
-        merged.extend(hits);
+            });
+        }
     }
 
-    // Global top-k: ascending score, id tiebreak (matches single-node ordering).
     merged.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -339,18 +602,57 @@ pub async fn coordinate_search(
     Ok(merged)
 }
 
-// ---- Internal-service helpers (the receiving/replica side) -----------------
+#[allow(clippy::too_many_arguments)]
+async fn search_one_replica(
+    state: &NodeState,
+    node_id: u64,
+    addr: &str,
+    collection: &str,
+    shard_idx: u32,
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+    schema: &CollectionSchema,
+) -> Result<Vec<(u64, f32)>, ConnError> {
+    if node_id == state.node_id {
+        let sref = ShardRef {
+            collection,
+            shard_idx,
+            dim: schema.dim as usize,
+            metric: metric_from_cluster(schema.metric),
+        };
+        state
+            .shards
+            .search_shard(&sref, query, k, ef_search)
+            .map_err(|_| ConnError)
+    } else {
+        let mut client = internal_client(addr).await?;
+        let resp = client
+            .replica_search(ReplicaSearchRequest {
+                collection: collection.to_string(),
+                shard_idx,
+                vector: query.to_vec(),
+                k: k as u32,
+                ef_search: ef_search as u32,
+            })
+            .await
+            .map_err(|_| ConnError)?
+            .into_inner();
+        Ok(resp.results.into_iter().map(|r| (r.id, r.score)).collect())
+    }
+}
 
-/// Apply a replica write locally (called by the internal service handler when a
-/// peer forwards a point op to this node).
+// ---- Internal-service helpers (the replica/receiving side) -----------------
+
+/// Apply a replica write locally (peer forwarded a point op to this node).
+/// Returns whether the write won LWW at this replica.
 pub fn apply_replica_write(
     state: &NodeState,
     req: &ReplicaWriteRequest,
     schema: &CollectionSchema,
 ) -> Result<bool, RouterError> {
     let hlc = Hlc::unpack(req.hlc);
-    // Advance this node's clock to keep the HLC monotone across nodes (M4 relies
-    // on this; harmless in M3).
+    // Advance the node's clock on receiving a remote stamp (HLC receive rule).
     let _ = state.clock.update(hlc);
     let sref = ShardRef {
         collection: &req.collection,
@@ -358,22 +660,17 @@ pub fn apply_replica_write(
         dim: schema.dim as usize,
         metric: metric_from_cluster(schema.metric),
     };
-
-    match req.op {
-        OP_DELETE => {
-            let removed = state.shards.delete(&sref, hlc, req.id)?;
-            Ok(removed)
-        }
-        _ => {
-            state
-                .shards
-                .upsert(&sref, hlc, req.id, &req.vector, req.payload.clone())?;
-            Ok(true)
-        }
-    }
+    let outcome = if req.op == OP_DELETE {
+        state.shards.delete(&sref, hlc, req.id)?
+    } else {
+        state
+            .shards
+            .upsert(&sref, hlc, req.id, &req.vector, req.payload.clone())?
+    };
+    Ok(outcome == WriteOutcome::Applied)
 }
 
-/// Read points locally for a replica Get.
+/// Read points locally for a replica Get (returns HLC + tombstone per id).
 pub fn apply_replica_get(
     state: &NodeState,
     collection: &str,
@@ -389,13 +686,13 @@ pub fn apply_replica_get(
     };
     let mut out = Vec::new();
     for id in ids {
-        if let Some(v) = state.shards.get(&sref, *id)? {
+        if let Some(sp) = state.shards.get_versioned(&sref, *id)? {
             out.push(ReplicaPoint {
-                id: *id,
-                hlc: 0, // M4 surfaces the stored HLC; M3 Get does not need it
-                tombstone: false,
-                vector: v,
-                payload: Vec::new(),
+                id: sp.id,
+                hlc: sp.hlc.pack(),
+                tombstone: sp.tombstone,
+                vector: sp.vector,
+                payload: sp.payload,
             });
         }
     }
@@ -403,6 +700,7 @@ pub fn apply_replica_get(
 }
 
 /// Search a single shard locally for a replica Search.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_replica_search(
     state: &NodeState,
     collection: &str,
@@ -427,4 +725,55 @@ pub fn apply_replica_search(
             payload: Vec::new(),
         })
         .collect())
+}
+
+// ---- Hinted-handoff replay -------------------------------------------------
+
+/// Replay buffered hints to replicas that are now reachable. Called periodically
+/// (a background loop) and after membership changes. For each hint whose target
+/// is reachable, push the write; drop replayed hints, keep the rest.
+pub async fn replay_hints(state: &NodeState) -> Result<usize, RouterError> {
+    let hints = state.read_all_hints()?;
+    if hints.is_empty() {
+        return Ok(0);
+    }
+    let meta = state.cluster.metadata().await;
+
+    let mut keep: Vec<Hint> = Vec::new();
+    let mut replayed = 0usize;
+
+    for hint in hints {
+        let addr = meta.nodes.get(&hint.target_node).cloned();
+        let Some(addr) = addr else {
+            keep.push(hint); // target unknown right now; keep buffering
+            continue;
+        };
+        let op = match hint.op {
+            WalOp::Delete => OP_DELETE,
+            WalOp::Upsert => OP_UPSERT,
+        };
+        let pushed = match internal_client(&addr).await {
+            Ok(mut client) => client
+                .replica_write(ReplicaWriteRequest {
+                    collection: hint.collection.clone(),
+                    shard_idx: hint.shard_idx,
+                    op,
+                    id: hint.id,
+                    hlc: hint.hlc.pack(),
+                    vector: hint.vector.clone(),
+                    payload: hint.payload.clone(),
+                })
+                .await
+                .is_ok(),
+            Err(ConnError) => false,
+        };
+        if pushed {
+            replayed += 1;
+        } else {
+            keep.push(hint);
+        }
+    }
+
+    state.rewrite_hints(&keep)?;
+    Ok(replayed)
 }

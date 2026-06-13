@@ -19,7 +19,7 @@ use qv_proto::v1::quorvec_server::Quorvec;
 use tonic::{Request, Response, Status};
 
 use crate::node_state::NodeState;
-use crate::router::{self, RouterError};
+use crate::router::{self, Consistency, RouterError};
 
 const VERSION: &str = concat!("quorvec ", env!("CARGO_PKG_VERSION"), " (M3 cluster)");
 
@@ -57,11 +57,10 @@ fn router_err_to_status(e: RouterError) -> Status {
     match e {
         RouterError::NotFound(_) => Status::not_found(e.to_string()),
         RouterError::DimMismatch { .. } => Status::invalid_argument(e.to_string()),
-        RouterError::NoReplica { .. } => Status::unavailable(e.to_string()),
-        RouterError::Transport { .. } | RouterError::Rpc { .. } => {
-            Status::unavailable(e.to_string())
-        }
-        RouterError::Shard(_) => Status::internal(e.to_string()),
+        RouterError::NoReplica { .. }
+        | RouterError::WriteQuorum { .. }
+        | RouterError::ReadQuorum { .. } => Status::unavailable(e.to_string()),
+        RouterError::Shard(_) | RouterError::Hint(_) => Status::internal(e.to_string()),
     }
 }
 
@@ -123,14 +122,16 @@ impl Quorvec for QuorvecService {
         request: Request<v1::UpsertRequest>,
     ) -> Result<Response<v1::UpsertResponse>, Status> {
         let req = request.into_inner();
+        let consistency = Consistency::from_proto(req.consistency);
         let points: Vec<(u64, Vec<f32>, Vec<u8>)> = req
             .points
             .into_iter()
             .map(|p| (p.id, p.vector, p.payload.unwrap_or_default()))
             .collect();
-        let upserted = router::coordinate_upsert(&self.state, &req.collection, &points)
-            .await
-            .map_err(router_err_to_status)?;
+        let upserted =
+            router::coordinate_upsert(&self.state, &req.collection, &points, consistency)
+                .await
+                .map_err(router_err_to_status)?;
         Ok(Response::new(v1::UpsertResponse { upserted }))
     }
 
@@ -139,9 +140,11 @@ impl Quorvec for QuorvecService {
         request: Request<v1::DeleteRequest>,
     ) -> Result<Response<v1::DeleteResponse>, Status> {
         let req = request.into_inner();
-        let deleted = router::coordinate_delete(&self.state, &req.collection, &req.ids)
-            .await
-            .map_err(router_err_to_status)?;
+        let consistency = Consistency::from_proto(req.consistency);
+        let deleted =
+            router::coordinate_delete(&self.state, &req.collection, &req.ids, consistency)
+                .await
+                .map_err(router_err_to_status)?;
         Ok(Response::new(v1::DeleteResponse { deleted }))
     }
 
@@ -150,7 +153,8 @@ impl Quorvec for QuorvecService {
         request: Request<v1::GetRequest>,
     ) -> Result<Response<v1::GetResponse>, Status> {
         let req = request.into_inner();
-        let points = router::coordinate_get(&self.state, &req.collection, &req.ids)
+        let consistency = Consistency::from_proto(req.read_consistency);
+        let points = router::coordinate_get(&self.state, &req.collection, &req.ids, consistency)
             .await
             .map_err(router_err_to_status)?
             .into_iter()

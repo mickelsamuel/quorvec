@@ -34,5 +34,11 @@ pub async fn build_node_state(cfg: &NodeConfig) -> anyhow::Result<Arc<NodeState>
     let advertise = cfg.advertise().to_string();
     let cluster = ClusterManager::start(cfg.node_id, advertise.clone()).await?;
     let shards = ShardStore::new(cfg.data_dir.clone(), cfg.snapshot_wal_mb, cfg.wal_batch_ms);
-    Ok(NodeState::new(cfg.node_id, advertise, cluster, shards))
+    Ok(NodeState::new(
+        cfg.node_id,
+        advertise,
+        cluster,
+        shards,
+        cfg.data_dir.clone(),
+    ))
 }

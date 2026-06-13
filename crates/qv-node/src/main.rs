@@ -51,6 +51,25 @@ async fn main() -> anyhow::Result<()> {
     let v1 = QuorvecService::new(state.clone());
     let internal = InternalService::new(state.clone());
 
+    // Hinted-handoff replay loop (M4): periodically push buffered hints to
+    // replicas that have come back. Cheap when there are no hints.
+    {
+        let hint_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                match qv_node::router::replay_hints(&hint_state).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(replayed = n, "replayed hinted-handoff writes")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(err = %e, "hint replay error"),
+                }
+            }
+        });
+    }
+
     // If this is the seed and join targets were given, admit each peer once it is
     // healthy. This lets `docker compose up` form a cluster with no extra tooling:
     // the seed bootstraps, then joins the listed nodes (id@host:port) through Raft.

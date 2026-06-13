@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use qv_cluster::Metric as ClusterMetric;
 use qv_hnsw::Metric;
-use qv_storage::{Hlc, Shard, ShardError};
+use qv_storage::{Hlc, PointVersion, Shard, ShardError, WriteOutcome};
 
 /// Key identifying one shard replica on this node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,7 +129,8 @@ impl ShardStore {
         self.shards.read().unwrap().contains_key(&key)
     }
 
-    /// Apply a durable upsert to a shard this node holds.
+    /// Apply a durable, LWW upsert to a shard this node holds. Returns whether
+    /// the write won (`Applied`) or lost to a newer stored version (`Stale`).
     pub fn upsert(
         &self,
         sref: &ShardRef<'_>,
@@ -137,7 +138,7 @@ impl ShardStore {
         id: u64,
         vector: &[f32],
         payload: Vec<u8>,
-    ) -> Result<(), ShardStoreError> {
+    ) -> Result<WriteOutcome, ShardStoreError> {
         if vector.len() != sref.dim {
             return Err(ShardStoreError::DimMismatch {
                 expected: sref.dim,
@@ -146,15 +147,19 @@ impl ShardStore {
         }
         let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
         let mut guard = shard.lock().unwrap();
-        guard.upsert(hlc, id, vector, payload)?;
-        Ok(())
+        Ok(guard.upsert_versioned(hlc, id, vector, payload)?)
     }
 
-    /// Apply a durable delete (tombstone) to a shard this node holds.
-    pub fn delete(&self, sref: &ShardRef<'_>, hlc: Hlc, id: u64) -> Result<bool, ShardStoreError> {
+    /// Apply a durable, LWW delete (tombstone). Returns the LWW outcome.
+    pub fn delete(
+        &self,
+        sref: &ShardRef<'_>,
+        hlc: Hlc,
+        id: u64,
+    ) -> Result<WriteOutcome, ShardStoreError> {
         let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
         let mut guard = shard.lock().unwrap();
-        Ok(guard.delete(hlc, id)?)
+        Ok(guard.delete_versioned(hlc, id)?)
     }
 
     /// Get a stored vector by id from a shard this node holds (live only).
@@ -162,6 +167,33 @@ impl ShardStore {
         let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
         let guard = shard.lock().unwrap();
         Ok(guard.get(id))
+    }
+
+    /// Get the full versioned point (vector + HLC + tombstone) for an id, used by
+    /// R-read LWW-merge and read repair. `None` if the shard never saw the id;
+    /// a tombstone entry if the id was deleted.
+    pub fn get_versioned(
+        &self,
+        sref: &ShardRef<'_>,
+        id: u64,
+    ) -> Result<Option<StoredPoint>, ShardStoreError> {
+        let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
+        let guard = shard.lock().unwrap();
+        let Some(PointVersion { hlc, tombstone }) = guard.version(id) else {
+            return Ok(None);
+        };
+        let vector = if tombstone {
+            Vec::new()
+        } else {
+            guard.get(id).unwrap_or_default()
+        };
+        Ok(Some(StoredPoint {
+            id,
+            hlc,
+            tombstone,
+            vector,
+            payload: Vec::new(),
+        }))
     }
 
     /// Search a single shard this node holds.

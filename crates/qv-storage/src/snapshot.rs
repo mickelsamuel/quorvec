@@ -10,19 +10,35 @@
 //! directory, fsync, then rename over the destination (rename is atomic on a
 //! single filesystem), so a crash never leaves a half-written snapshot in place.
 
+use crate::hlc::Hlc;
 use qv_hnsw::HnswIndex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// On-disk snapshot: the index image and the WAL offset it already includes.
+/// Serializable per-point version stored in the snapshot (mirrors
+/// `shard::PointVersion`, kept here to avoid a circular type dependency).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VersionEntry {
+    pub hlc: Hlc,
+    pub tombstone: bool,
+}
+
+/// On-disk snapshot: the index image, the per-point LWW versions, and the WAL
+/// offset it already includes.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     /// WAL byte offset up to and including which this image reflects all writes.
     pub wal_offset: u64,
     /// The serialized index.
     pub index: HnswIndex,
+    /// Per-id winning version for last-writer-wins (M4). Older snapshots without
+    /// this field deserialize it as empty (serde default) and the shard rebuilds
+    /// it from the WAL tail on recovery.
+    #[serde(default)]
+    pub versions: HashMap<u64, VersionEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,11 +55,16 @@ impl Snapshot {
         path: impl AsRef<Path>,
         wal_offset: u64,
         index: &HnswIndex,
+        versions: &HashMap<u64, VersionEntry>,
     ) -> Result<(), SnapshotError> {
         let path = path.as_ref();
         let tmp: PathBuf = path.with_extension("snap.tmp");
 
-        let snap = SnapshotRef { wal_offset, index };
+        let snap = SnapshotRef {
+            wal_offset,
+            index,
+            versions,
+        };
         let bytes = bincode::serialize(&snap)?;
 
         {
@@ -84,6 +105,7 @@ impl Snapshot {
 struct SnapshotRef<'a> {
     wal_offset: u64,
     index: &'a HnswIndex,
+    versions: &'a HashMap<u64, VersionEntry>,
 }
 
 #[cfg(test)]
@@ -102,7 +124,8 @@ mod tests {
             idx.insert(i, &[i as f32, 0.0, 1.0, 2.0]).unwrap();
         }
 
-        Snapshot::write(&path, 4096, &idx).unwrap();
+        let versions = HashMap::new();
+        Snapshot::write(&path, 4096, &idx, &versions).unwrap();
         let loaded = Snapshot::load(&path).unwrap().unwrap();
         assert_eq!(loaded.wal_offset, 4096);
         assert_eq!(loaded.index.len(), 100);

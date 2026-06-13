@@ -84,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn wait_healthy(ep: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Generous: on a busy CI runner the container image build + cold start of the
+    // node process can take a while before the gRPC port accepts connections; this
+    // wait must outlast that, or the smoke job flakes on slow runners (not a bug).
+    let deadline = Instant::now() + Duration::from_secs(150);
     loop {
         if let Ok(mut c) = Client::connect(ep.to_string()).await {
             if c.health().await.is_ok() {
@@ -102,7 +105,7 @@ async fn wait_cluster_ready(
     ep: &str,
     expected_nodes: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(mut c) = Client::connect(ep.to_string()).await {
             if let Ok(info) = c.cluster_info().await {

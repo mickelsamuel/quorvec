@@ -22,6 +22,7 @@
 //! verbatim, never silently swallowed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use openraft::Config;
@@ -55,10 +56,17 @@ pub struct ClusterManager {
 }
 
 impl ClusterManager {
-    /// Construct the manager and start the local Raft instance. Does NOT form or
-    /// join a cluster — call [`bootstrap`] (founding node) or have an existing
-    /// leader [`join_node`] this node afterward.
-    pub async fn start(node_id: NodeId, advertise_addr: String) -> Result<Self, ManagerError> {
+    /// Construct the manager and start the local Raft instance with **durable**
+    /// storage under `<data_dir>/raft` (ruling R6). Does NOT form or join a
+    /// cluster — call [`bootstrap`] (founding node) or have an existing leader
+    /// [`join_node`] this node afterward. On restart, the durable log +
+    /// state-machine image are recovered before Raft starts, so a node (or the
+    /// whole cluster) comes back with its metadata intact.
+    pub async fn start(
+        node_id: NodeId,
+        advertise_addr: String,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, ManagerError> {
         // Conservative timers: heartbeat 250ms, election 1000-1500ms. Slow enough
         // to be stable on a shared localhost host, fast enough that a leader-kill
         // re-elects within a couple seconds (the M3 acceptance window).
@@ -77,8 +85,12 @@ impl ClusterManager {
                 .map_err(|e| ManagerError::Raft(format!("invalid raft config: {e}")))?,
         );
 
-        let log_store = LogStore::default();
-        let sm = StateMachineStore::default();
+        // Durable Raft storage under <data_dir>/raft (ruling R6).
+        let raft_dir = data_dir.as_ref().join("raft");
+        let log_store = LogStore::open(&raft_dir)
+            .map_err(|e| ManagerError::Raft(format!("open durable raft log store: {e}")))?;
+        let sm = StateMachineStore::open(&raft_dir)
+            .map_err(|e| ManagerError::Raft(format!("open durable raft state machine: {e}")))?;
         let network = RaftGrpcNetwork;
 
         let raft = Raft::new(node_id, config, network, log_store, sm.clone())
@@ -108,9 +120,25 @@ impl ClusterManager {
     }
 
     /// Initialize a brand-new single-node cluster with this node as the founding
-    /// voter, then register its address in the directory. Idempotent-ish: a
-    /// second call returns the openraft "already initialized" error verbatim.
+    /// voter, then register its address in the directory.
+    ///
+    /// **Restart-safe (ruling R6).** With durable Raft storage, a seed node that
+    /// restarts already has its membership + log on disk. Re-running `initialize`
+    /// would be rejected (`InitializeError::NotAllowed`), so we first check
+    /// `is_initialized()` and, when already initialized, simply resume from the
+    /// recovered durable state — no re-initialize, no re-register. This is what
+    /// lets the founding node survive a full-cluster restart.
     pub async fn bootstrap(&self) -> Result<(), ManagerError> {
+        let already = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(|e| ManagerError::Raft(format!("is_initialized: {e}")))?;
+        if already {
+            // Durable state recovered: the cluster already exists. Resume.
+            return Ok(());
+        }
+
         let mut members = BTreeMap::new();
         members.insert(self.node_id, self.node_record());
         self.raft

@@ -104,10 +104,13 @@ All four are integration tests on a 5-process localhost cluster
 - Conflict resolution is **per point id**, not per request or per batch.
 - Read repair and hint replay are **asynchronous and best-effort**: convergence
   is eventual, not bounded to a deadline by these tests.
-- The metadata-plane Raft log is **in-memory** in this build; a restarted node
-  recovers its metadata by leader replication (openraft
-  `loosen-follower-log-revert`). Durable on-disk Raft log persistence is a
-  labeled future item. The *data* plane is durable on disk (WAL + snapshots).
+- The metadata-plane Raft log **and** state-machine snapshot are **durable on
+  disk** (under `<data_dir>/raft/`, fsync'd before each acknowledged write). A
+  single restarted node resumes from its own persisted log, and a **full-cluster
+  restart** (every node killed and restarted) recovers all collections and the
+  shard map without relying on a surviving peer — proven by
+  `crates/qv-node/tests/restart_r6.rs`. The *data* plane is likewise durable on
+  disk (WAL + snapshots).
 - These properties are demonstrated on a **single-host 5-process cluster**, not a
   multi-host deployment, and under the specific fault injections above — not an
   exhaustive partition/linearizability suite (that is the M6 failure-testing

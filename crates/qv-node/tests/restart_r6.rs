@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use qv_client::Client;
 use qv_proto::v1;
 
+mod common;
+
 struct NodeProc {
     id: u64,
     addr: String,
@@ -160,6 +162,7 @@ async fn collections_seen(ep: &str) -> BTreeSet<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_cluster_restart_recovers_metadata_r6() {
+    let _cluster_guard = common::acquire_cluster_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut nodes = start_cluster(&tmp).await;
     let seed_ep = nodes[0].endpoint();

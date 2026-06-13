@@ -45,20 +45,22 @@ crc32fast = "1.4"
 # 0.10 line is alpha as of 2026-06. Pre-1.0 API per the plan; storage-v2 splits
 # the log store from the state-machine store.
 #
-# `loosen-follower-log-revert` was enabled in M3/M4 to tolerate the IN-MEMORY Raft
-# log: a node killed and restarted came back empty (a log "reversion"), which
-# would otherwise panic the leader. Ruling R6 made the Raft log + state machine
-# DURABLE under data_dir, so a normally-restarted node now resumes from its
-# persisted log/vote with no reversion. The flag is therefore NO LONGER NEEDED and
-# is removed: re-verified the full workspace green without it, including the
-# full-cluster-restart recovery test (all 5 nodes killed + restarted) and the
-# M3/M4 node-restart paths. The one residual scenario it covered — a node whose
-# entire data_dir is wiped then silently restarted empty — is now handled the
-# correct way (remove it from membership and re-join it fresh), not by tolerating
-# a phantom reversion. (Re-evaluation recorded in 04_BUILD/M5-log.md.)
+# `loosen-follower-log-revert` — RE-EVALUATED under ruling R6 and KEPT. R6 made the
+# Raft log + state machine DURABLE under data_dir, so the *common* full-restart
+# path no longer relies on it (the full-cluster-restart recovery test passes with
+# or without it). BUT it is still a needed safety net: under restart-heavy / timing
+# -adverse conditions a follower can still present a log/vote that openraft views as
+# a "reversion" during leader establishment, which without this feature trips an
+# internal assertion (`engine_impl.rs` "commit vote can not fail") and panics
+# RaftCore. The feature is the documented, sanctioned switch for exactly that case
+# (databendlabs/openraft FAQ + feature flags) and is harmless when not exercised,
+# so removing it would be an unsafe optimization. It stays. (Full re-evaluation,
+# including the observed panic that reversed the earlier remove-it decision, is in
+# 04_BUILD/M5-log.md.)
 openraft = { version = "0.9.24", features = [
     "serde",
     "storage-v2",
+    "loosen-follower-log-revert",
 ] }
 
 # Serialization.

@@ -26,6 +26,8 @@ use qv_proto::v1;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+mod common;
+
 /// One spawned node process plus its connection info.
 struct Node {
     id: u64,
@@ -134,6 +136,7 @@ fn clustered(rng: &mut StdRng, dim: usize, centers: &[Vec<f32>]) -> Vec<f32> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_process_cluster_m3_acceptance() {
+    let _cluster_guard = common::acquire_cluster_lock();
     let tmp = tempfile::tempdir().unwrap();
 
     // ---- 1. Bring up node 1 (bootstrap) ------------------------------------

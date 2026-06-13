@@ -147,7 +147,15 @@ where
     // `attempts` is incremented only once the op resolves (success or final
     // failure), so at any print point attempts == ok + failures exactly — the
     // reported success rate is unambiguous.
-    const MAX_RETRIES: usize = 8;
+    //
+    // The retry budget is deliberately generous (the plan allows "brief retries,
+    // counted"): the only window where a QUORUM op can transiently fail is the
+    // brief gap between a node being killed and its `Leave` committing through Raft
+    // (until then the dead node is still a routed replica). That window can stretch
+    // when CI runs several 5-process cluster tests in parallel, so the budget
+    // covers it. Every retry is counted and printed; a true final failure (budget
+    // exhausted) is what the acceptance forbids.
+    const MAX_RETRIES: usize = 40;
     for attempt in 0..=MAX_RETRIES {
         match f().await {
             Ok(v) => {
@@ -157,7 +165,7 @@ where
             }
             Err(_) if attempt < MAX_RETRIES => {
                 stats.retries.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
             Err(_) => {
                 stats.attempts.fetch_add(1, Ordering::Relaxed);

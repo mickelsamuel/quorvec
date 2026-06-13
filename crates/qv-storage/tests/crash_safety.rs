@@ -110,8 +110,49 @@ fn run_one_iteration(shard_dir: &Path, run_for: Duration) -> Vec<u64> {
     acked
 }
 
+/// Hold the shared heavy-integration-test lock for the test's lifetime; deletes
+/// the lockfile on drop.
+struct SerialGuard(PathBuf);
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Serialize against the cluster integration tests (in qv-node). This kill -9
+/// harness is CPU/disk heavy; running it alongside a multi-process cluster test
+/// starves both. The same global lockfile the cluster tests use coordinates them.
+fn acquire_serial_lock() -> SerialGuard {
+    let path = std::env::temp_dir().join("quorvec-cluster-test.lock");
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return SerialGuard(path),
+            Err(_) => {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(modified) = meta.modified() {
+                        if modified.elapsed().unwrap_or_default() > Duration::from_secs(300) {
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                    }
+                }
+                if start.elapsed() > Duration::from_secs(600) {
+                    return SerialGuard(path);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 #[test]
 fn kill9_crash_safety_20_iterations() {
+    let _serial = acquire_serial_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let shard_dir = tmp.path().join("crash_shard");
 

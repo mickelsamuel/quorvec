@@ -263,9 +263,17 @@ async fn meta_client(addr: &str) -> Result<QuorvecInternalClient<Channel>, ()> {
     } else {
         format!("http://{addr}")
     };
-    QuorvecInternalClient::connect(endpoint)
+    // Short connect/request timeouts so forwarding to a leader that just changed
+    // (or a momentarily-unreachable one) fails fast and the reconcile retries next
+    // pass instead of stalling the loop.
+    let channel = Channel::from_shared(endpoint)
+        .map_err(|_| ())?
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(3))
+        .connect()
         .await
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    Ok(QuorvecInternalClient::new(channel))
 }
 
 /// The background reconcile loop: run `reconcile_once` on a fixed interval. Spawned

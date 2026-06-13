@@ -23,6 +23,8 @@ use qv_proto::internal::quorvec_internal_client::QuorvecInternalClient;
 use qv_proto::internal::{ReplicaGetRequest, ReplicaWriteRequest};
 use qv_proto::v1;
 
+mod common;
+
 struct NodeProc {
     id: u64,
     addr: String,
@@ -201,6 +203,7 @@ async fn locate_id(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quorum_replication_m4_acceptance() {
+    let _cluster_guard = common::acquire_cluster_lock();
     let (_tmp, mut nodes) = start_cluster().await;
     let seed_ep = nodes[0].endpoint();
     const DIM: usize = 8;

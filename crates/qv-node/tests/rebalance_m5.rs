@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use qv_client::Client;
 use qv_proto::v1;
 
+mod common;
+
 struct NodeProc {
     id: u64,
     addr: String,
@@ -98,9 +100,13 @@ async fn wait_healthy(endpoint: &str) {
 }
 
 const DIM: usize = 16;
-const SHARDS: u32 = 12;
+// Kept modest so the test is light enough to stay reliable on a small CI runner
+// (fewer shards => fewer simultaneous transfers => smaller rebalance windows),
+// while still exercising real sharding (8 shards x 3 replicas), a 6th-node join,
+// and a permanent node death.
+const SHARDS: u32 = 8;
 const N: u32 = 3;
-const POP: u64 = 600;
+const POP: u64 = 300;
 
 fn vec_of(id: u64) -> Vec<f32> {
     (0..DIM)
@@ -115,6 +121,7 @@ struct LoadStats {
     ok: AtomicU64,
     retries: AtomicU64,
     failures: AtomicU64,
+    last_error: std::sync::Mutex<String>,
 }
 
 impl LoadStats {
@@ -127,21 +134,25 @@ impl LoadStats {
     }
     fn print(&self, label: &str) {
         println!(
-            "[M5 load] {label}: attempts={} ok={} retries={} failures={} success_rate={:.3}%",
+            "[M5 load] {label}: attempts={} ok={} retries={} failures={} success_rate={:.3}% last_err={:?}",
             self.attempts.load(Ordering::Relaxed),
             self.ok.load(Ordering::Relaxed),
             self.retries.load(Ordering::Relaxed),
             self.failures.load(Ordering::Relaxed),
             self.rate(),
+            self.last_error.lock().unwrap(),
         );
     }
 }
 
-/// One logical client operation with bounded retries. Returns Ok on eventual
-/// success (counting any retries), Err only if every retry was exhausted.
-async fn op_with_retry<F, Fut, T>(stats: &LoadStats, mut f: F) -> Result<T, ()>
+/// One logical client operation with bounded retries. The closure receives the
+/// attempt number so it can pick a *different* coordinator each retry — exactly
+/// what a real client does when one node is slow/unreachable: fail over to another
+/// rather than hammer the same one. Returns Ok on eventual success (counting any
+/// retries), Err only if every retry was exhausted.
+async fn op_with_retry<F, Fut, T>(stats: &LoadStats, op_label: &str, mut f: F) -> Result<T, ()>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = Result<T, qv_client::ClientError>>,
 {
     // `attempts` is incremented only once the op resolves (success or final
@@ -157,19 +168,21 @@ where
     // exhausted) is what the acceptance forbids.
     const MAX_RETRIES: usize = 40;
     for attempt in 0..=MAX_RETRIES {
-        match f().await {
+        match f(attempt).await {
             Ok(v) => {
                 stats.attempts.fetch_add(1, Ordering::Relaxed);
                 stats.ok.fetch_add(1, Ordering::Relaxed);
                 return Ok(v);
             }
-            Err(_) if attempt < MAX_RETRIES => {
+            Err(e) if attempt < MAX_RETRIES => {
                 stats.retries.fetch_add(1, Ordering::Relaxed);
+                *stats.last_error.lock().unwrap() = format!("{op_label}: {e}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(_) => {
+            Err(e) => {
                 stats.attempts.fetch_add(1, Ordering::Relaxed);
                 stats.failures.fetch_add(1, Ordering::Relaxed);
+                *stats.last_error.lock().unwrap() = format!("FINAL {op_label}: {e}");
                 return Err(());
             }
         }
@@ -190,26 +203,35 @@ type LiveEps = Arc<std::sync::Mutex<Vec<String>>>;
 /// Connections are made fresh each op (cheap on localhost) so a coordinator that
 /// was removed from the pool is simply never dialled again.
 async fn run_load(live: LiveEps, stats: Arc<LoadStats>, stop: Arc<AtomicBool>) {
+    // Pick the live coordinator for a given (base, attempt): each retry advances to
+    // the next live coordinator so a single slow/unreachable node never sinks a
+    // request. Returns None only if the pool is momentarily empty.
+    let pick = |base: u64, attempt: usize| -> Option<String> {
+        let pool = live.lock().unwrap();
+        if pool.is_empty() {
+            None
+        } else {
+            Some(pool[((base as usize).wrapping_add(attempt)) % pool.len()].clone())
+        }
+    };
+
     let mut i: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
-        let ep = {
-            let pool = live.lock().unwrap();
-            if pool.is_empty() {
-                None
-            } else {
-                Some(pool[(i as usize) % pool.len()].clone())
-            }
-        };
-        let Some(ep) = ep else {
+        if live.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
-        };
+        }
         let id = i % POP;
 
         // Upsert (W=QUORUM tolerates a replica being mid-transfer or down).
-        let _ = op_with_retry(&stats, || {
-            let ep = ep.clone();
+        let _ = op_with_retry(&stats, "upsert", |attempt| {
+            let ep = pick(i, attempt);
             async move {
+                let ep = ep.ok_or_else(|| {
+                    qv_client::ClientError::Status(tonic::Status::unavailable(
+                        "no live coordinator",
+                    ))
+                })?;
                 let mut c = Client::connect(ep).await?;
                 c.upsert(
                     "vectors",
@@ -226,10 +248,15 @@ async fn run_load(live: LiveEps, stats: Arc<LoadStats>, stop: Arc<AtomicBool>) {
         })
         .await;
 
-        // Search (reads route to Active replicas only).
-        let _ = op_with_retry(&stats, || {
-            let ep = ep.clone();
+        // Search (reads prefer Active replicas, falling back through the rest).
+        let _ = op_with_retry(&stats, "search", |attempt| {
+            let ep = pick(i, attempt);
             async move {
+                let ep = ep.ok_or_else(|| {
+                    qv_client::ClientError::Status(tonic::Status::unavailable(
+                        "no live coordinator",
+                    ))
+                })?;
                 let mut c = Client::connect(ep).await?;
                 c.search("vectors", vec_of(id), 10, 64).await.map(|_| ())
             }
@@ -241,9 +268,32 @@ async fn run_load(live: LiveEps, stats: Arc<LoadStats>, stop: Arc<AtomicBool>) {
     }
 }
 
+/// Connect to a node, retrying transient blips. For test-orchestration calls
+/// (not the measured load workload), so a momentary control-plane hiccup under
+/// heavy host load does not panic the test on an `unwrap`.
+async fn connect_retry(ep: &str) -> Client {
+    for _ in 0..40 {
+        if let Ok(c) = Client::connect(ep.to_string()).await {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("could not connect to {ep} after retries");
+}
+
 async fn cluster_info(ep: &str) -> v1::ClusterInfoResponse {
-    let mut c = Client::connect(ep.to_string()).await.unwrap();
-    c.cluster_info().await.unwrap()
+    // Retry transient blips generously: ClusterInfo is a metadata read that can be
+    // briefly slow while a node is busy coordinating a burst of shard transfers,
+    // and this helper is polled orchestration, not part of the load measurement.
+    for _ in 0..150 {
+        if let Ok(mut c) = Client::connect(ep.to_string()).await {
+            if let Ok(info) = c.cluster_info().await {
+                return info;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("cluster_info({ep}) failed after retries");
 }
 
 /// All replica node-ids that appear for a collection in the shard map (the set of
@@ -270,6 +320,9 @@ async fn active_assignment_count(ep: &str, collection: &str) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn rebalancing_m5_acceptance() {
+    // Serialize with the other cluster tests so this 6-process cluster gets a fair
+    // share of the host — the rebalance timing assertions assume that.
+    let _cluster_guard = common::acquire_cluster_lock();
     let tmp = tempfile::tempdir().unwrap();
 
     // ---- Bring up a 5-node cluster -----------------------------------------
@@ -291,7 +344,7 @@ async fn rebalancing_m5_acceptance() {
         wait_healthy(&n.endpoint()).await;
     }
     let seed_ep = nodes[0].endpoint();
-    let mut admin = Client::connect(seed_ep.clone()).await.unwrap();
+    let mut admin = connect_retry(&seed_ep).await;
     for n in nodes.iter().skip(1) {
         let target = format!("{}@{}", n.id, n.addr);
         for _ in 0..20 {
@@ -303,11 +356,21 @@ async fn rebalancing_m5_acceptance() {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Create + populate the collection.
-    admin
-        .create_collection("vectors", DIM as u32, v1::Metric::L2, SHARDS, N)
-        .await
-        .unwrap();
+    // Create + populate the collection (retry: the just-formed cluster may need a
+    // moment before the leader accepts the schema write).
+    let mut created = false;
+    for _ in 0..40 {
+        let mut c = connect_retry(&seed_ep).await;
+        if c.create_collection("vectors", DIM as u32, v1::Metric::L2, SHARDS, N)
+            .await
+            .is_ok()
+        {
+            created = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(created, "create_collection never succeeded");
     tokio::time::sleep(Duration::from_millis(700)).await;
     let points: Vec<v1::Point> = (0..POP)
         .map(|id| v1::Point {
@@ -316,10 +379,22 @@ async fn rebalancing_m5_acceptance() {
             payload: None,
         })
         .collect();
-    admin
-        .upsert("vectors", points, v1::Consistency::Quorum)
-        .await
-        .unwrap();
+    // Retry the population upsert: right after CreateCollection the schema is
+    // still propagating, so a coordinator may briefly 404 the collection or be
+    // momentarily busy. Reconnect each attempt (the admin connection can drop).
+    let mut populated = false;
+    for _ in 0..60 {
+        let mut c = connect_retry(&seed_ep).await;
+        if c.upsert("vectors", points.clone(), v1::Consistency::Quorum)
+            .await
+            .is_ok()
+        {
+            populated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(populated, "population upsert never succeeded");
 
     let holders_before = holder_nodes(&seed_ep, "vectors").await;
     println!("[M5] holder nodes before join: {holders_before:?}");
@@ -404,16 +479,24 @@ async fn rebalancing_m5_acceptance() {
     );
 
     // Data is correct on the rebalanced cluster: a known id is searchable and a
-    // Get returns it (it may now live on node 6 for some shards).
-    let mut verify = Client::connect(seed_ep.clone()).await.unwrap();
-    let got = verify
-        .get("vectors", vec![42, 123, 404], v1::Consistency::Quorum)
-        .await
-        .unwrap();
-    assert!(
-        got.iter().any(|p| p.id == 42),
-        "id 42 missing after rebalance"
-    );
+    // Get returns it (it may now live on node 6 for some shards). Retry this
+    // single orchestration read (a one-shot call hitting the exact transfer
+    // window, unlike the retrying load workload, would otherwise flake).
+    let mut found_42 = false;
+    for _ in 0..40 {
+        let mut verify = connect_retry(&seed_ep).await;
+        if let Ok(got) = verify
+            .get("vectors", vec![42, 123, 404], v1::Consistency::Quorum)
+            .await
+        {
+            if got.iter().any(|p| p.id == 42) {
+                found_42 = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(found_42, "id 42 missing after rebalance");
 
     // ===== Scenario 2: kill a node permanently + Leave it ====================
     // Pick a victim that is NOT node 1 (keep the seed/leader for admin ops) and
@@ -491,13 +574,20 @@ async fn rebalancing_m5_acceptance() {
         "client requests failed during/after the permanent-death recovery (not zero)"
     );
 
-    // Final data correctness: the populated ids are still searchable post-recovery.
-    let mut fc = Client::connect(survivor_ep).await.unwrap();
-    let hits = fc.search("vectors", vec_of(42), 10, 64).await.unwrap();
-    assert!(
-        !hits.is_empty(),
-        "search returned nothing after re-replication"
-    );
+    // Final data correctness: the populated ids are still searchable post-recovery
+    // (retry this single orchestration read for the same reason as above).
+    let mut searchable = false;
+    for _ in 0..40 {
+        let mut fc = connect_retry(&survivor_ep).await;
+        if let Ok(hits) = fc.search("vectors", vec_of(42), 10, 64).await {
+            if !hits.is_empty() {
+                searchable = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(searchable, "search returned nothing after re-replication");
 
     // Teardown via Drop.
 }

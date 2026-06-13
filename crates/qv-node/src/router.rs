@@ -144,15 +144,29 @@ fn active_replicas_with_addrs(
         .collect()
 }
 
+/// How long to wait for a TCP connect to a peer before treating it as
+/// unreachable. Kept short so a *dead* replica is detected fast and the
+/// coordinator proceeds to hinted handoff + quorum instead of blocking on the OS
+/// default connect timeout (tens of seconds on Linux) — which would otherwise
+/// stall every quorum write whose replica set includes a just-killed node.
+const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Per-request timeout to a peer, so a hung (not-yet-dead) replica also fails fast.
+const PEER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn internal_client(addr: &str) -> Result<QuorvecInternalClient<Channel>, ConnError> {
     let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
     } else {
         format!("http://{addr}")
     };
-    QuorvecInternalClient::connect(endpoint)
+    let channel = Channel::from_shared(endpoint)
+        .map_err(|_| ConnError)?
+        .connect_timeout(PEER_CONNECT_TIMEOUT)
+        .timeout(PEER_REQUEST_TIMEOUT)
+        .connect()
         .await
-        .map_err(|_| ConnError)
+        .map_err(|_| ConnError)?;
+    Ok(QuorvecInternalClient::new(channel))
 }
 
 /// A marker for "could not reach the peer" — drives hinted handoff and
@@ -386,9 +400,15 @@ pub async fn coordinate_get(
 
     for id in ids {
         let shard_idx = shard_for_id(*id, schema.shard_count);
-        // Reads use only Active replicas: a Syncing replica may be mid-transfer
-        // and not yet hold the data.
-        let replicas = active_replicas_with_addrs(&meta, collection, shard_idx);
+        // Get reads the FULL replica set (including a Syncing one) and LWW-merges
+        // by HLC. Including a mid-transfer replica is safe for a point lookup: if
+        // it is behind, it just contributes an older/absent version that LWW
+        // discards, and read-repair catches it up. Crucially, R is computed
+        // against N (the replication factor), so the read keeps its fault
+        // tolerance during a rebalance — it does NOT tighten to "all of the
+        // currently-Active replicas", which would make a single replica hiccup
+        // fail the read while a transfer is in flight.
+        let replicas = replicas_with_addrs(&meta, collection, shard_idx);
         if replicas.is_empty() {
             return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
@@ -588,17 +608,33 @@ pub async fn coordinate_search(
 
     let mut merged: Vec<(u64, f32)> = Vec::new();
     for shard_idx in 0..schema.shard_count {
-        // Search uses only Active replicas (a Syncing one may lack the data).
-        let replicas = active_replicas_with_addrs(&meta, collection, shard_idx);
-        if replicas.is_empty() {
+        // Prefer Active replicas (complete data). But if every Active replica is
+        // momentarily unreachable — e.g. during a rebalance where a shard's prior
+        // Active holder just went down and its replacement is still Syncing — fall
+        // back to the full replica set rather than failing the request. A Syncing
+        // replica holds all recent writes plus whatever history it has streamed so
+        // far, so it answers a search far better than returning an error. The Active
+        // ones are always tried first, so this fallback only fires when there is no
+        // Active replica left to serve, keeping search available through churn.
+        let active = active_replicas_with_addrs(&meta, collection, shard_idx);
+        let all = replicas_with_addrs(&meta, collection, shard_idx);
+        if all.is_empty() {
             return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
                 shard_idx,
             });
         }
+        // Active first (deduplicated: the fallback appends only the non-Active).
+        let active_ids: std::collections::BTreeSet<u64> =
+            active.iter().map(|(id, _)| *id).collect();
+        let ordered: Vec<(u64, String)> = active
+            .iter()
+            .cloned()
+            .chain(all.into_iter().filter(|(id, _)| !active_ids.contains(id)))
+            .collect();
         // Try replicas in order until one answers (one healthy replica per shard).
         let mut got = false;
-        for (node_id, addr) in &replicas {
+        for (node_id, addr) in &ordered {
             match search_one_replica(
                 state, *node_id, addr, collection, shard_idx, query, k, ef_search, &schema,
             )

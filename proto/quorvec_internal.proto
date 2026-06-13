@@ -93,6 +93,49 @@ message ReplicaSearchResponse {
   repeated ReplicaScored results = 1;
 }
 
+// ----- Shard transfer / rebalancing (M5) ------------------------------------
+//
+// `stream_records` shard transfer (Qdrant blueprint): a target node pulling a
+// shard it has been newly assigned streams every record from a source node that
+// already holds it, rebuilding its own durable shard from the stream. The source
+// streams live points AND tombstones with their HLCs so the target applies them
+// LWW-correctly (and a concurrent live write during the transfer is never
+// clobbered by an older streamed record). wal_delta / snapshot transfer modes are
+// v1.1 and intentionally NOT built.
+
+message StreamShardRequest {
+  string collection = 1;
+  uint32 shard_idx = 2;
+}
+
+// One record in the stream: a versioned point (live or tombstone) exactly as the
+// source holds it, so the target can apply it under the same LWW rule.
+message ShardRecord {
+  uint64 id = 1;
+  uint64 hlc = 2; // packed HLC
+  bool tombstone = 3;
+  repeated float vector = 4; // empty for a tombstone
+  bytes payload = 5;
+}
+
+message StreamShardResponse {
+  repeated ShardRecord records = 1;
+}
+
+// A metadata-plane write forwarded to the leader (M5). Any node that needs to
+// commit a shard-state transition (Syncing/Active/Dead) during rebalancing but is
+// not the leader forwards the request here; the leader commits it through Raft.
+// The payload is a serialized `MetaRequest` (JSON, same as the Raft transport) so
+// the internal proto stays decoupled from the openraft/meta types.
+message MetaWriteRequest {
+  bytes request = 1; // serialized MetaRequest
+}
+
+message MetaWriteResponse {
+  bool committed = 1;
+  string note = 2; // the apply note, or an error description
+}
+
 service QuorvecInternal {
   // Metadata-plane Raft transport.
   rpc RaftRpc(RaftEnvelope) returns (RaftReply);
@@ -101,4 +144,9 @@ service QuorvecInternal {
   rpc ReplicaWrite(ReplicaWriteRequest) returns (ReplicaWriteResponse);
   rpc ReplicaGet(ReplicaGetRequest) returns (ReplicaGetResponse);
   rpc ReplicaSearch(ReplicaSearchRequest) returns (ReplicaSearchResponse);
+
+  // Shard transfer + rebalancing (M5).
+  rpc StreamShard(StreamShardRequest) returns (StreamShardResponse);
+  // Forward a metadata write (shard-state transition) to the leader.
+  rpc MetaWrite(MetaWriteRequest) returns (MetaWriteResponse);
 }

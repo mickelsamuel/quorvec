@@ -57,6 +57,10 @@ pub enum ShardError {
     DimMismatch { expected: usize, got: usize },
 }
 
+/// One enumerated shard record for the M5 `stream_records` transfer:
+/// `(id, hlc, tombstone, vector)` — the vector empty for a tombstone.
+pub type ShardRecordRow = (u64, Hlc, bool, Vec<f32>);
+
 /// A single durable shard.
 pub struct Shard {
     dir: PathBuf,
@@ -281,6 +285,26 @@ impl Shard {
     /// The stored version (HLC + tombstone) for an id, if the shard has seen it.
     pub fn version(&self, id: u64) -> Option<PointVersion> {
         self.versions.get(&id).copied()
+    }
+
+    /// Enumerate every record this shard has seen — live points and tombstones —
+    /// as `(id, hlc, tombstone, vector)`, the vector empty for a tombstone. Used
+    /// by the M5 `stream_records` shard transfer: a pulling target replays these
+    /// under LWW to rebuild the shard. Iterating `versions` (not just the live
+    /// index) means tombstones travel too, so a delete is not silently undone on
+    /// the new replica.
+    pub fn records(&self) -> Vec<ShardRecordRow> {
+        self.versions
+            .iter()
+            .map(|(&id, v)| {
+                let vector = if v.tombstone {
+                    Vec::new()
+                } else {
+                    self.index.get_vector(id).unwrap_or_default()
+                };
+                (id, v.hlc, v.tombstone, vector)
+            })
+            .collect()
     }
 
     /// k-NN search over the live index.

@@ -10,6 +10,7 @@
 pub mod config;
 pub mod internal_service;
 pub mod node_state;
+pub mod rebalance;
 pub mod router;
 pub mod service;
 pub mod shards;

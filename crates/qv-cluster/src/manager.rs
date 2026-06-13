@@ -30,7 +30,7 @@ use qv_proto::internal::{RaftEnvelope, RaftReply, RaftRpcKind};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::meta::{CollectionSchema, MetaRequest, MetaState, ShardAssignment};
+use crate::meta::{CollectionSchema, MetaRequest, MetaState, ShardAssignment, ShardState};
 use crate::raft::{LogStore, Node, NodeId, Raft, RaftGrpcNetwork, StateMachineStore};
 
 /// Coarse cluster-manager error. The gRPC layer maps these to tonic statuses.
@@ -254,6 +254,69 @@ impl ClusterManager {
     /// The current Raft leader, if known.
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
+    }
+
+    /// Whether this node is the current Raft leader.
+    pub fn is_leader(&self) -> bool {
+        self.current_leader() == Some(self.node_id)
+    }
+
+    /// The advertise address of the current leader, if one is known and in the
+    /// directory. Used to forward a metadata write from a follower (M5).
+    pub async fn leader_addr(&self) -> Option<String> {
+        let leader = self.current_leader()?;
+        self.sm.read_state().await.nodes.get(&leader).cloned()
+    }
+
+    /// Set a single shard replica's operational state (M5 transfer lifecycle),
+    /// committed through Raft. Succeeds only on the leader; a follower gets
+    /// [`ManagerError::NotLeader`] and should forward via the internal `MetaWrite`
+    /// RPC (see the node layer's `set_shard_state`).
+    pub async fn set_shard_state(
+        &self,
+        collection: String,
+        shard_idx: u32,
+        node_id: NodeId,
+        state: ShardState,
+    ) -> Result<String, ManagerError> {
+        self.write(MetaRequest::SetShardState {
+            collection,
+            shard_idx,
+            node_id,
+            state,
+        })
+        .await
+    }
+
+    /// Leader side of the internal `MetaWrite` forward: commit a (already
+    /// deserialized) [`MetaRequest`] through Raft. Returns the apply note.
+    pub async fn commit_meta_request(&self, req: MetaRequest) -> Result<String, ManagerError> {
+        self.write(req).await
+    }
+
+    /// Leader side of the internal `MetaWrite` forward, taking the serialized
+    /// `MetaRequest` bytes (JSON). Keeps serde_json inside this crate so the node
+    /// layer does not need a direct dependency on it.
+    pub async fn commit_meta_request_bytes(&self, bytes: &[u8]) -> Result<String, ManagerError> {
+        let req: MetaRequest = serde_json::from_slice(bytes)
+            .map_err(|e| ManagerError::Invalid(format!("bad MetaRequest: {e}")))?;
+        self.write(req).await
+    }
+
+    /// Serialize a `SetShardState` request to bytes for the `MetaWrite` forward.
+    pub fn encode_set_shard_state(
+        collection: String,
+        shard_idx: u32,
+        node_id: NodeId,
+        state: ShardState,
+    ) -> Result<Vec<u8>, ManagerError> {
+        serde_json::to_vec(&MetaRequest::SetShardState {
+            collection,
+            shard_idx,
+            node_id,
+            state,
+        })
+        .map_err(ManagerError::Serde)
     }
 
     /// A consistent read of the metadata state machine.

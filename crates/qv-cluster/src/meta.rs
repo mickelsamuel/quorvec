@@ -121,7 +121,40 @@ pub struct MetaState {
     /// Per-replica operational state overrides, keyed by
     /// (collection, shard_idx, node_id). Absent = Active. M3 keeps everything
     /// Active; M5 writes Syncing/Dead here.
+    ///
+    /// Serialized as a sequence of `(key, value)` pairs, NOT a JSON object: JSON
+    /// object keys must be strings, and this map's key is a tuple. The durable
+    /// Raft state-machine image (ruling R6) and every Raft snapshot serialize
+    /// `MetaState` via serde_json, so a tuple-keyed map MUST round-trip through a
+    /// sequence or serde_json fails with "key must be a string". `shard_states_seq`
+    /// does exactly that.
+    #[serde(with = "shard_states_seq")]
     pub shard_states: BTreeMap<(String, u32, NodeId), ShardState>,
+}
+
+/// serde adapter: (de)serialize a tuple-keyed map as a sequence of entries so it
+/// survives JSON (object keys must be strings; a tuple key cannot be one).
+mod shard_states_seq {
+    use super::{BTreeMap, NodeId, ShardState};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    type Key = (String, u32, NodeId);
+
+    pub fn serialize<S>(map: &BTreeMap<Key, ShardState>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<(&Key, &ShardState)> = map.iter().collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<Key, ShardState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries: Vec<(Key, ShardState)> = Vec::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
 }
 
 impl MetaState {
@@ -318,6 +351,42 @@ mod tests {
         });
         assert_eq!(s.shard_state("c", 0, 1), ShardState::Active);
         assert!(s.shard_states.is_empty());
+    }
+
+    #[test]
+    fn metastate_with_shard_states_roundtrips_through_serde_json() {
+        // Regression guard: MetaState is serialized via serde_json into the
+        // durable Raft state machine (R6) and every Raft snapshot. shard_states is
+        // a tuple-keyed map, which JSON cannot key by — it must round-trip as a
+        // sequence. A populated map MUST serialize without "key must be a string".
+        let mut s = MetaState::default();
+        s.apply(&MetaRequest::RegisterNode {
+            node_id: 1,
+            advertise_addr: "127.0.0.1:7001".into(),
+        });
+        s.apply(&MetaRequest::CreateCollection {
+            name: "c".into(),
+            schema: schema(64, 3, 8),
+        });
+        s.apply(&MetaRequest::SetShardState {
+            collection: "c".into(),
+            shard_idx: 3,
+            node_id: 1,
+            state: ShardState::Syncing,
+        });
+        s.apply(&MetaRequest::SetShardState {
+            collection: "c".into(),
+            shard_idx: 5,
+            node_id: 1,
+            state: ShardState::Dead,
+        });
+        assert!(!s.shard_states.is_empty());
+
+        let bytes = serde_json::to_vec(&s).expect("MetaState must serialize to JSON");
+        let back: MetaState = serde_json::from_slice(&bytes).expect("and deserialize");
+        assert_eq!(s, back, "MetaState did not round-trip through serde_json");
+        assert_eq!(back.shard_state("c", 3, 1), ShardState::Syncing);
+        assert_eq!(back.shard_state("c", 5, 1), ShardState::Dead);
     }
 
     #[test]

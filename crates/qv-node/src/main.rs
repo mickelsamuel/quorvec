@@ -70,6 +70,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Rebalance reconcile loop (M5): each node reconciles its assigned shards
+    // against the deterministic placement — acquiring shards it should hold (via
+    // stream_records transfer) and dropping shards it no longer owns once the
+    // hand-off is complete. Drives join rebalancing and dead-replica recovery.
+    qv_node::rebalance::spawn_reconcile_loop(state.clone());
+
     // If this is the seed and join targets were given, admit each peer once it is
     // healthy. This lets `docker compose up` form a cluster with no extra tooling:
     // the seed bootstraps, then joins the listed nodes (id@host:port) through Raft.

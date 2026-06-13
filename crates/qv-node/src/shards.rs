@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use qv_cluster::Metric as ClusterMetric;
 use qv_hnsw::Metric;
-use qv_storage::{Hlc, PointVersion, Shard, ShardError, WriteOutcome};
+use qv_storage::{Hlc, PointVersion, Shard, ShardError, ShardRecordRow, WriteOutcome};
 
 /// Key identifying one shard replica on this node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -127,6 +127,34 @@ impl ShardStore {
             shard_idx,
         };
         self.shards.read().unwrap().contains_key(&key)
+    }
+
+    /// Enumerate every record (live + tombstone) of a shard this node holds, for
+    /// the M5 `stream_records` transfer. Returns an empty vec if the shard isn't
+    /// materialized here.
+    pub fn records(&self, sref: &ShardRef<'_>) -> Result<Vec<ShardRecordRow>, ShardStoreError> {
+        let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
+        let guard = shard.lock().unwrap();
+        Ok(guard.records())
+    }
+
+    /// Number of live points in a shard this node holds (0 if not materialized).
+    pub fn shard_len(&self, sref: &ShardRef<'_>) -> Result<usize, ShardStoreError> {
+        let shard = self.get_or_open(sref.collection, sref.shard_idx, sref.dim, sref.metric)?;
+        let guard = shard.lock().unwrap();
+        Ok(guard.len())
+    }
+
+    /// Drop one materialized shard (the M5 "source drop" after a transfer hands a
+    /// shard off, or when this node is no longer a replica for it). Removes it
+    /// from the in-memory map; the on-disk directory is left for reuse/reaping
+    /// (same v1 policy as `drop_collection`).
+    pub fn drop_shard(&self, collection: &str, shard_idx: u32) {
+        let key = ShardKey {
+            collection: collection.to_string(),
+            shard_idx,
+        };
+        self.shards.write().unwrap().remove(&key);
     }
 
     /// Apply a durable, LWW upsert to a shard this node holds. Returns whether

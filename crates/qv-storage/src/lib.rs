@@ -14,6 +14,6 @@ pub mod wal;
 
 pub use hints::{Hint, HintError, HintLog};
 pub use hlc::{Hlc, HlcClock};
-pub use shard::{PointVersion, Shard, ShardError, WriteOutcome};
+pub use shard::{PointVersion, Shard, ShardError, ShardRecordRow, WriteOutcome};
 pub use snapshot::Snapshot;
 pub use wal::{Wal, WalError, WalOp, WalRecord};

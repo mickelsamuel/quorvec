@@ -57,6 +57,21 @@ quorvec has two independent consistency domains:
   point operations (upsert/get/delete) carry the consistency guarantees, not
   search.
 
+- **Rebalancing (shard transfer).** Placement is deterministic from the Raft
+  membership, so a node join or leave changes which nodes a shard's N replicas
+  resolve to. A node that becomes a new replica for a shard it lacks marks itself
+  `Syncing` (through Raft), streams the shard's full record set from an `Active`
+  holder (`stream_records`), rebuilds its durable shard under LWW, then cuts over
+  to `Active`. A node that is no longer a replica drops its copy only once every
+  desired replica is `Active`. **Reads and search route to `Active` replicas
+  only**, so a replica that is mid-transfer is never read from; meanwhile it still
+  receives live writes, so a write that lands during a transfer is not lost (LWW
+  reconciles the streamed-older against the live-newer record). The prior holders
+  stay `Active` throughout, so an `Active` replica with the data is always
+  available — the rebalance does not drop or stale a single request. Node
+  leave / permanent death recovers under-replicated shards through this same
+  transfer path.
+
 ## What `R = W = QUORUM` does and does not give you
 
 With `W + R > N` (e.g. both QUORUM on N=3: 2 + 2 > 3) a read quorum and a write
@@ -69,8 +84,10 @@ writes can observe or create staleness that converges later.
 
 ## What the tests actually prove
 
-All four are integration tests on a 5-process localhost cluster
-(`crates/qv-node/tests/quorum_m4.rs`), driving the real node binary over gRPC.
+These are integration tests on a 5-process localhost cluster, driving the real
+node binary over gRPC. (a)-(d) live in `crates/qv-node/tests/quorum_m4.rs`; the
+rebalancing and durable-restart claims live in `tests/rebalance_m5.rs` and
+`tests/restart_r6.rs`.
 
 - **(a) W=QUORUM survives one replica down, and the hint replays.** With one of a
   shard's three replicas killed, a QUORUM upsert still succeeds (2 of 3 ack). When
@@ -94,6 +111,21 @@ All four are integration tests on a 5-process localhost cluster
   falling forward to a healthy replica. *Proves:* scatter-gather routes around a
   single per-shard replica loss.
 
+- **(M5) Rebalancing under continuous load, zero failed requests.** With a client
+  workload running throughout: adding a 6th node moves shards to it (it becomes a
+  holder via the `stream_records` transfer) and every shard replica returns to
+  `Active`, at 100% request success (0 failures, brief retries counted and
+  printed); then killing a node permanently and `Leave`-ing it re-replicates the
+  under-replicated shards to N `Active` healthy replicas, again at 100% request
+  success. *Proves:* shard transfer on join and dead-replica recovery do not drop,
+  stale, or fail client requests.
+
+- **(R6) Full-cluster restart recovers the metadata plane.** All five nodes are
+  killed and restarted on their data dirs; the recovered cluster reports identical
+  collections and an identical shard map, every node agrees, and the populated
+  data is still searchable. *Proves:* the durable Raft log + state-machine
+  snapshot recover the metadata plane with no surviving peer.
+
 ## Honest limitations (do not claim beyond these)
 
 - The data plane is **eventually consistent, LWW** — not linearizable, not
@@ -104,10 +136,18 @@ All four are integration tests on a 5-process localhost cluster
 - Conflict resolution is **per point id**, not per request or per batch.
 - Read repair and hint replay are **asynchronous and best-effort**: convergence
   is eventual, not bounded to a deadline by these tests.
-- The metadata-plane Raft log is **in-memory** in this build; a restarted node
-  recovers its metadata by leader replication (openraft
-  `loosen-follower-log-revert`). Durable on-disk Raft log persistence is a
-  labeled future item. The *data* plane is durable on disk (WAL + snapshots).
+- The metadata-plane Raft log **and** state-machine snapshot are **durable on
+  disk** (under `<data_dir>/raft/`, fsync'd before each acknowledged write). A
+  single restarted node resumes from its own persisted log, and a **full-cluster
+  restart** (every node killed and restarted) recovers all collections and the
+  shard map without relying on a surviving peer — proven by
+  `crates/qv-node/tests/restart_r6.rs`. The *data* plane is likewise durable on
+  disk (WAL + snapshots).
+- **Shard transfer is `stream_records` only.** A transfer ships the whole shard's
+  record set and rebuilds the target's index. The faster `wal_delta` (ship only
+  the WAL diff) and `snapshot` transfer modes are labeled v1.1 and not built. The
+  stream is currently a single unary response (fine at the tested scale); chunked
+  server-streaming for very large shards is a labeled follow-up.
 - These properties are demonstrated on a **single-host 5-process cluster**, not a
   multi-host deployment, and under the specific fault injections above — not an
   exhaustive partition/linearizability suite (that is the M6 failure-testing

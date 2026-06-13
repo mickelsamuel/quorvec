@@ -22,6 +22,7 @@
 //! verbatim, never silently swallowed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use openraft::Config;
@@ -29,7 +30,7 @@ use qv_proto::internal::{RaftEnvelope, RaftReply, RaftRpcKind};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::meta::{CollectionSchema, MetaRequest, MetaState, ShardAssignment};
+use crate::meta::{CollectionSchema, MetaRequest, MetaState, ShardAssignment, ShardState};
 use crate::raft::{LogStore, Node, NodeId, Raft, RaftGrpcNetwork, StateMachineStore};
 
 /// Coarse cluster-manager error. The gRPC layer maps these to tonic statuses.
@@ -55,10 +56,17 @@ pub struct ClusterManager {
 }
 
 impl ClusterManager {
-    /// Construct the manager and start the local Raft instance. Does NOT form or
-    /// join a cluster — call [`bootstrap`] (founding node) or have an existing
-    /// leader [`join_node`] this node afterward.
-    pub async fn start(node_id: NodeId, advertise_addr: String) -> Result<Self, ManagerError> {
+    /// Construct the manager and start the local Raft instance with **durable**
+    /// storage under `<data_dir>/raft` (ruling R6). Does NOT form or join a
+    /// cluster — call [`bootstrap`] (founding node) or have an existing leader
+    /// [`join_node`] this node afterward. On restart, the durable log +
+    /// state-machine image are recovered before Raft starts, so a node (or the
+    /// whole cluster) comes back with its metadata intact.
+    pub async fn start(
+        node_id: NodeId,
+        advertise_addr: String,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, ManagerError> {
         // Conservative timers: heartbeat 250ms, election 1000-1500ms. Slow enough
         // to be stable on a shared localhost host, fast enough that a leader-kill
         // re-elects within a couple seconds (the M3 acceptance window).
@@ -77,8 +85,12 @@ impl ClusterManager {
                 .map_err(|e| ManagerError::Raft(format!("invalid raft config: {e}")))?,
         );
 
-        let log_store = LogStore::default();
-        let sm = StateMachineStore::default();
+        // Durable Raft storage under <data_dir>/raft (ruling R6).
+        let raft_dir = data_dir.as_ref().join("raft");
+        let log_store = LogStore::open(&raft_dir)
+            .map_err(|e| ManagerError::Raft(format!("open durable raft log store: {e}")))?;
+        let sm = StateMachineStore::open(&raft_dir)
+            .map_err(|e| ManagerError::Raft(format!("open durable raft state machine: {e}")))?;
         let network = RaftGrpcNetwork;
 
         let raft = Raft::new(node_id, config, network, log_store, sm.clone())
@@ -108,9 +120,25 @@ impl ClusterManager {
     }
 
     /// Initialize a brand-new single-node cluster with this node as the founding
-    /// voter, then register its address in the directory. Idempotent-ish: a
-    /// second call returns the openraft "already initialized" error verbatim.
+    /// voter, then register its address in the directory.
+    ///
+    /// **Restart-safe (ruling R6).** With durable Raft storage, a seed node that
+    /// restarts already has its membership + log on disk. Re-running `initialize`
+    /// would be rejected (`InitializeError::NotAllowed`), so we first check
+    /// `is_initialized()` and, when already initialized, simply resume from the
+    /// recovered durable state — no re-initialize, no re-register. This is what
+    /// lets the founding node survive a full-cluster restart.
     pub async fn bootstrap(&self) -> Result<(), ManagerError> {
+        let already = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(|e| ManagerError::Raft(format!("is_initialized: {e}")))?;
+        if already {
+            // Durable state recovered: the cluster already exists. Resume.
+            return Ok(());
+        }
+
         let mut members = BTreeMap::new();
         members.insert(self.node_id, self.node_record());
         self.raft
@@ -226,6 +254,69 @@ impl ClusterManager {
     /// The current Raft leader, if known.
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
+    }
+
+    /// Whether this node is the current Raft leader.
+    pub fn is_leader(&self) -> bool {
+        self.current_leader() == Some(self.node_id)
+    }
+
+    /// The advertise address of the current leader, if one is known and in the
+    /// directory. Used to forward a metadata write from a follower (M5).
+    pub async fn leader_addr(&self) -> Option<String> {
+        let leader = self.current_leader()?;
+        self.sm.read_state().await.nodes.get(&leader).cloned()
+    }
+
+    /// Set a single shard replica's operational state (M5 transfer lifecycle),
+    /// committed through Raft. Succeeds only on the leader; a follower gets
+    /// [`ManagerError::NotLeader`] and should forward via the internal `MetaWrite`
+    /// RPC (see the node layer's `set_shard_state`).
+    pub async fn set_shard_state(
+        &self,
+        collection: String,
+        shard_idx: u32,
+        node_id: NodeId,
+        state: ShardState,
+    ) -> Result<String, ManagerError> {
+        self.write(MetaRequest::SetShardState {
+            collection,
+            shard_idx,
+            node_id,
+            state,
+        })
+        .await
+    }
+
+    /// Leader side of the internal `MetaWrite` forward: commit a (already
+    /// deserialized) [`MetaRequest`] through Raft. Returns the apply note.
+    pub async fn commit_meta_request(&self, req: MetaRequest) -> Result<String, ManagerError> {
+        self.write(req).await
+    }
+
+    /// Leader side of the internal `MetaWrite` forward, taking the serialized
+    /// `MetaRequest` bytes (JSON). Keeps serde_json inside this crate so the node
+    /// layer does not need a direct dependency on it.
+    pub async fn commit_meta_request_bytes(&self, bytes: &[u8]) -> Result<String, ManagerError> {
+        let req: MetaRequest = serde_json::from_slice(bytes)
+            .map_err(|e| ManagerError::Invalid(format!("bad MetaRequest: {e}")))?;
+        self.write(req).await
+    }
+
+    /// Serialize a `SetShardState` request to bytes for the `MetaWrite` forward.
+    pub fn encode_set_shard_state(
+        collection: String,
+        shard_idx: u32,
+        node_id: NodeId,
+        state: ShardState,
+    ) -> Result<Vec<u8>, ManagerError> {
+        serde_json::to_vec(&MetaRequest::SetShardState {
+            collection,
+            shard_idx,
+            node_id,
+            state,
+        })
+        .map_err(ManagerError::Serde)
     }
 
     /// A consistent read of the metadata state machine.

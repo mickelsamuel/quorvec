@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use qv_proto::internal::quorvec_internal_server::QuorvecInternal;
 use qv_proto::internal::{
-    RaftEnvelope, RaftReply, ReplicaGetRequest, ReplicaGetResponse, ReplicaSearchRequest,
-    ReplicaSearchResponse, ReplicaWriteRequest, ReplicaWriteResponse,
+    MetaWriteRequest, MetaWriteResponse, RaftEnvelope, RaftReply, ReplicaGetRequest,
+    ReplicaGetResponse, ReplicaSearchRequest, ReplicaSearchResponse, ReplicaWriteRequest,
+    ReplicaWriteResponse, StreamShardRequest, StreamShardResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -118,5 +119,41 @@ impl QuorvecInternal for InternalService {
         )
         .map_err(router_err)?;
         Ok(Response::new(ReplicaSearchResponse { results }))
+    }
+
+    async fn stream_shard(
+        &self,
+        request: Request<StreamShardRequest>,
+    ) -> Result<Response<StreamShardResponse>, Status> {
+        let req = request.into_inner();
+        let schema = self.schema(&req.collection).await?;
+        let records =
+            router::apply_stream_shard(&self.state, &req.collection, req.shard_idx, &schema)
+                .map_err(router_err)?;
+        Ok(Response::new(StreamShardResponse { records }))
+    }
+
+    async fn meta_write(
+        &self,
+        request: Request<MetaWriteRequest>,
+    ) -> Result<Response<MetaWriteResponse>, Status> {
+        let req = request.into_inner();
+        // Only the leader can commit; a non-leader returns failed_precondition so
+        // the caller re-resolves the leader and retries.
+        match self
+            .state
+            .cluster
+            .commit_meta_request_bytes(&req.request)
+            .await
+        {
+            Ok(note) => Ok(Response::new(MetaWriteResponse {
+                committed: true,
+                note,
+            })),
+            Err(qv_cluster::ManagerError::NotLeader(_)) => {
+                Err(Status::failed_precondition("not the leader"))
+            }
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 }

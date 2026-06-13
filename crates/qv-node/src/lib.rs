@@ -10,6 +10,7 @@
 pub mod config;
 pub mod internal_service;
 pub mod node_state;
+pub mod rebalance;
 pub mod router;
 pub mod service;
 pub mod shards;
@@ -32,7 +33,9 @@ use qv_cluster::ClusterManager;
 /// so a node can come up and then be wired into a cluster deterministically.
 pub async fn build_node_state(cfg: &NodeConfig) -> anyhow::Result<Arc<NodeState>> {
     let advertise = cfg.advertise().to_string();
-    let cluster = ClusterManager::start(cfg.node_id, advertise.clone()).await?;
+    // Durable Raft storage lives under <data_dir>/raft (ruling R6).
+    let cluster =
+        ClusterManager::start(cfg.node_id, advertise.clone(), cfg.data_dir.clone()).await?;
     let shards = ShardStore::new(cfg.data_dir.clone(), cfg.snapshot_wal_mb, cfg.wal_batch_ms);
     Ok(NodeState::new(
         cfg.node_id,

@@ -21,9 +21,10 @@
 //!   through the replica list) and merges a global top-k.
 //! - **Delete** = an HLC-stamped tombstone, replicated exactly like an upsert.
 
-use qv_cluster::{shard_for_id, CollectionSchema, MetaState};
+use qv_cluster::{shard_for_id, CollectionSchema, MetaState, ShardState};
 use qv_proto::internal::{
     ReplicaGetRequest, ReplicaPoint, ReplicaScored, ReplicaSearchRequest, ReplicaWriteRequest,
+    ShardRecord, StreamShardRequest,
 };
 use qv_proto::QuorvecInternalClient;
 use qv_storage::{Hint, Hlc, WalOp, WriteOutcome};
@@ -113,9 +114,32 @@ async fn schema_of(
 /// The replica node ids for a shard with their advertise addresses, clockwise
 /// from the home (first = primary). Replicas whose address is unknown are
 /// dropped (they cannot be routed to).
+///
+/// This is the **write** view: it includes replicas in every state, because a
+/// `Syncing` replica (one receiving an M5 shard transfer) must still receive
+/// concurrent live writes so the transfer cannot lose a write that lands
+/// mid-flight (LWW reconciles the streamed-older vs live-newer records).
 fn replicas_with_addrs(meta: &MetaState, collection: &str, shard_idx: u32) -> Vec<(u64, String)> {
     meta.replicas_for_shard(collection, shard_idx)
         .into_iter()
+        .filter_map(|id| meta.nodes.get(&id).map(|a| (id, a.clone())))
+        .collect()
+}
+
+/// The **read/search** view of a shard's replicas: only those in `Active` state.
+/// A `Syncing` replica is excluded because it may not yet hold the shard's data
+/// (it is mid-transfer), so routing a read there could miss points. During a
+/// transfer the prior holders stay `Active`, so an Active replica with the data
+/// always remains — reads route around the syncing one and never fail or go
+/// stale because of the rebalance.
+fn active_replicas_with_addrs(
+    meta: &MetaState,
+    collection: &str,
+    shard_idx: u32,
+) -> Vec<(u64, String)> {
+    meta.replicas_for_shard(collection, shard_idx)
+        .into_iter()
+        .filter(|id| meta.shard_state(collection, shard_idx, *id) == ShardState::Active)
         .filter_map(|id| meta.nodes.get(&id).map(|a| (id, a.clone())))
         .collect()
 }
@@ -362,7 +386,9 @@ pub async fn coordinate_get(
 
     for id in ids {
         let shard_idx = shard_for_id(*id, schema.shard_count);
-        let replicas = replicas_with_addrs(&meta, collection, shard_idx);
+        // Reads use only Active replicas: a Syncing replica may be mid-transfer
+        // and not yet hold the data.
+        let replicas = active_replicas_with_addrs(&meta, collection, shard_idx);
         if replicas.is_empty() {
             return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
@@ -562,7 +588,8 @@ pub async fn coordinate_search(
 
     let mut merged: Vec<(u64, f32)> = Vec::new();
     for shard_idx in 0..schema.shard_count {
-        let replicas = replicas_with_addrs(&meta, collection, shard_idx);
+        // Search uses only Active replicas (a Syncing one may lack the data).
+        let replicas = active_replicas_with_addrs(&meta, collection, shard_idx);
         if replicas.is_empty() {
             return Err(RouterError::NoReplica {
                 collection: collection.to_string(),
@@ -776,4 +803,102 @@ pub async fn replay_hints(state: &NodeState) -> Result<usize, RouterError> {
 
     state.rewrite_hints(&keep)?;
     Ok(replayed)
+}
+
+// ---- Shard transfer (M5: stream_records) -----------------------------------
+
+/// Server side of `StreamShard`: enumerate every record (live + tombstone) of a
+/// shard this node holds, so a pulling target can rebuild it. Returns an empty
+/// list if this node does not materialize the shard (the caller picks another
+/// source).
+pub fn apply_stream_shard(
+    state: &NodeState,
+    collection: &str,
+    shard_idx: u32,
+    schema: &CollectionSchema,
+) -> Result<Vec<ShardRecord>, RouterError> {
+    let sref = ShardRef {
+        collection,
+        shard_idx,
+        dim: schema.dim as usize,
+        metric: metric_from_cluster(schema.metric),
+    };
+    // Only stream from a shard we actually hold (don't lazily create an empty one
+    // just to serve a transfer — that would hand the target nothing).
+    if !state.shards.has_shard(collection, shard_idx) {
+        return Ok(Vec::new());
+    }
+    let records = state.shards.records(&sref)?;
+    Ok(records
+        .into_iter()
+        .map(|(id, hlc, tombstone, vector)| ShardRecord {
+            id,
+            hlc: hlc.pack(),
+            tombstone,
+            vector,
+            payload: Vec::new(),
+        })
+        .collect())
+}
+
+/// Target side of `stream_records`: pull a shard's full record set from `source`
+/// and apply it to this node's durable shard under LWW.
+///
+/// LWW is what makes a transfer concurrent-write-safe: a streamed record only
+/// wins on the target if its HLC is newer than whatever the target already holds
+/// for that id. So a live write that landed on the target mid-transfer (because a
+/// Syncing replica still receives writes) is never clobbered by an older streamed
+/// copy, and a streamed tombstone correctly suppresses a stale resurrection.
+///
+/// Returns the number of records the target accepted (won LWW). A transfer from a
+/// source that turns out not to hold the shard yields 0 and the caller tries the
+/// next source.
+pub async fn pull_shard(
+    state: &NodeState,
+    source_addr: &str,
+    collection: &str,
+    shard_idx: u32,
+    schema: &CollectionSchema,
+) -> Result<usize, RouterError> {
+    let mut client = internal_client(source_addr)
+        .await
+        .map_err(|_| RouterError::NoReplica {
+            collection: collection.to_string(),
+            shard_idx,
+        })?;
+    let resp = client
+        .stream_shard(StreamShardRequest {
+            collection: collection.to_string(),
+            shard_idx,
+        })
+        .await
+        .map_err(|_| RouterError::NoReplica {
+            collection: collection.to_string(),
+            shard_idx,
+        })?
+        .into_inner();
+
+    let sref = ShardRef {
+        collection,
+        shard_idx,
+        dim: schema.dim as usize,
+        metric: metric_from_cluster(schema.metric),
+    };
+    let mut applied = 0usize;
+    for rec in resp.records {
+        let hlc = Hlc::unpack(rec.hlc);
+        // Keep our clock ahead of any HLC we ingest (HLC receive rule).
+        let _ = state.clock.update(hlc);
+        let outcome = if rec.tombstone {
+            state.shards.delete(&sref, hlc, rec.id)?
+        } else {
+            state
+                .shards
+                .upsert(&sref, hlc, rec.id, &rec.vector, rec.payload)?
+        };
+        if outcome == WriteOutcome::Applied {
+            applied += 1;
+        }
+    }
+    Ok(applied)
 }
